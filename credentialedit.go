@@ -162,27 +162,14 @@ func saveEditedCredential(ctx context.Context, target, revision, content, trace 
 		return errCredentialChanged
 	}
 	log.Printf("[凭据编辑] traceId=%s 阶段=保存 文件=%q 旧字节=%d 新字节=%d 说明=版本检查通过，仅记录文件与长度，绝不记录JSON正文或令牌", trace, target, len(old), len(content))
-	write := func(data []byte) error {
-		n, err := f.WriteAt(data, 0)
-		if err == nil && n != len(data) {
-			err = io.ErrShortWrite
-		}
-		if err == nil {
-			err = f.Truncate(int64(len(data)))
-		}
-		if err == nil {
-			err = f.Sync()
-		}
-		return err
-	}
-	if err := write([]byte(content)); err != nil {
-		if restoreErr := write(old); restoreErr != nil {
-			return errors.New("凭据保存失败且恢复旧文件失败，请检查服务器磁盘状态")
-		}
-		return errors.New("凭据保存失败，旧文件已恢复")
+	// 原子替换前必须先关闭目标句柄：Go 在 Windows 上打开的句柄不含 FILE_SHARE_DELETE，
+	// 不关闭时 rename 会因共享冲突失败。写失败时目标文件未被触碰，无需恢复旧内容。
+	_ = f.Close()
+	if err := atomicWriteFile(target, []byte(content), 0600); err != nil {
+		return errors.New("凭据保存失败，原文件未被修改")
 	}
 	clearDisabledMarker(target)
-	info, err := f.Stat()
+	info, err := root.Stat(filepath.Base(target))
 	if err != nil {
 		return err
 	}

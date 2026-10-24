@@ -746,11 +746,7 @@ func saveModelsCache(source string, catalogs map[string][]catalogModel, probes m
 	if err != nil {
 		return err
 	}
-	tmp := modelsCacheFile + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, modelsCacheFile)
+	return atomicWriteFile(modelsCacheFile, data, 0600)
 }
 
 func persistModelsLocked(source string) error {

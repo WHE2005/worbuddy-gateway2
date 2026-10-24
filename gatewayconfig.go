@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"sync"
@@ -126,36 +125,13 @@ func readGatewayDocumentLocked() (map[string]json.RawMessage, gatewayFileConfig,
 	return doc, g, data, err
 }
 
-// writeConfigPreservingFile 原位写入以保留现有文件 ACL；失败时尽力恢复原文。
-// 不创建含密钥的临时替换文件，不声称提供断电事务保证。
+// writeConfigPreservingFile 原子替换 config.json：同目录临时文件 + fsync + 改名，
+// 断电或进程被强杀时文件要么是完整旧内容、要么是完整新内容；替换失败时原文件不变，
+// 因此失败恢复路径（调用方把 previous 写回）通常不再需要，但保持兼容。
+// 临时文件以 config.json.tmp 命名且权限 0600，与原文件一致；新增文件继承目录 ACL。
 func writeConfigPreservingFile(data, previous []byte) error {
-	f, err := os.OpenFile(runtimeConfigFile, os.O_CREATE|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	write := func(content []byte) error {
-		n, err := f.WriteAt(content, 0)
-		if err == nil && n != len(content) {
-			err = io.ErrShortWrite
-		}
-		if err == nil {
-			err = f.Truncate(int64(len(content)))
-		}
-		if err == nil {
-			err = f.Sync()
-		}
-		return err
-	}
-	if err := write(data); err != nil {
-		if previous != nil {
-			if restoreErr := write(previous); restoreErr != nil {
-				return fmt.Errorf("配置写入失败: %v；恢复原文件也失败，请检查文件: %w", err, restoreErr)
-			}
-		}
-		return err
-	}
-	return nil
+	_ = previous
+	return atomicWriteFile(runtimeConfigFile, data, 0600)
 }
 
 func persistGatewayConfigLocked(doc map[string]json.RawMessage, g gatewayFileConfig, old []byte, trace string) error {

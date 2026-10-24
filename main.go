@@ -876,7 +876,7 @@ func saveAuth(sa *StoredAuth) error {
 		log.Printf("[凭据保存] traceId=%s 阶段=编码 结果=失败 原因=%v 业务影响=当前内存凭据未切换", traceID, err)
 		return err
 	}
-	if err := os.WriteFile(cfg.AuthFile, data, 0600); err != nil {
+	if err := atomicWriteFile(cfg.AuthFile, data, 0600); err != nil {
 		log.Printf("[凭据保存] traceId=%s 阶段=写入磁盘 结果=失败 原因=%v 业务影响=当前内存凭据未切换", traceID, err)
 		return err
 	}
@@ -900,7 +900,7 @@ func saveAuthTo(path string, sa *StoredAuth) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := atomicWriteFile(path, data, 0600); err != nil {
 		return err
 	}
 	clearDisabledMarker(path)
@@ -2630,14 +2630,8 @@ func saveCheckinStateLocked() {
 		log.Printf("[Checkin] 保存签到尝试状态失败: %v", err)
 		return
 	}
-	tmp := checkinStatePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	if err := atomicWriteFile(checkinStatePath, data, 0600); err != nil {
 		log.Printf("[Checkin] 写入签到尝试状态失败: %v", err)
-		return
-	}
-	if err := os.Rename(tmp, checkinStatePath); err != nil {
-		log.Printf("[Checkin] 提交签到尝试状态失败: %v", err)
-		_ = os.Remove(tmp)
 	}
 }
 
@@ -3051,15 +3045,8 @@ func writeStatusSnapshot() error {
 	if err != nil {
 		return err
 	}
-	// 原子写：先写临时文件再改名，避免 monitor 读到半截内容
-	tmp := statusSnapshotFile + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, statusSnapshotFile); err != nil {
-		return err
-	}
-	return nil
+	// 原子写：临时文件 + fsync + 改名，monitor 读不到半截内容，断电也不损文件
+	return atomicWriteFile(statusSnapshotFile, data, 0600)
 }
 
 func displayWidth(s string) int {
