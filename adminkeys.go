@@ -2,8 +2,10 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"strings"
 )
 
 // handleWebUIAPIKeys 管理台的模型 API Key 列表管理。
@@ -12,7 +14,7 @@ import (
 func handleWebUIAPIKeys(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeAdminData(w, r, apiKeyListView())
+		writeAPIKeysView(w, r)
 	case http.MethodPost:
 		var input struct {
 			Keys []APIKeyEntry `json:"keys"`
@@ -37,7 +39,7 @@ func handleWebUIAPIKeys(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Printf("[API Keys] traceId=%s 结果=保存成功 数量=%d 说明=立即生效，已有流式请求不受影响，Key 原文不进入日志", trace, len(input.Keys))
-		writeAdminData(w, r, apiKeyListView())
+		writeAPIKeysView(w, r)
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "仅支持 GET/POST")
 	}
@@ -57,6 +59,13 @@ func apiKeyListView() map[string]any {
 	return map[string]any{"apiKeyEnabled": cfg.APIKey != "", "enabledCount": enabled, "keys": keys}
 }
 
+// writeAPIKeysView 明文返回 Key 列表。绝不能走 writeAdminData：它的统一脱敏会把
+// 已注册为日志秘密的 Key 值替换成字面量 "[REDACTED]"，前端把占位符存回就会毁掉真实 Key。
+// 明文出口与凭据编辑接口同一安全模型：仅管理鉴权可达，no-store，不写日志正文。
+func writeAPIKeysView(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, apiKeyListView())
+}
+
 // saveAPIKeys 全量替换 gateway.keys 并原子落盘；保存后旧单 Key 字段置空，
 // 运行时 Key 立即切换（persistGatewayConfigLocked 内同步内存）。
 func saveAPIKeys(keys []APIKeyEntry, trace string) error {
@@ -70,6 +79,12 @@ func saveAPIKeys(keys []APIKeyEntry, trace string) error {
 	}
 	if cfg.AdminKey == "" || !adminKeyMatches(g.AdminKey, cfg.AdminKey) {
 		return errConfigChange
+	}
+	// 防占位符污染：脱敏视图回存会把 "[REDACTED]"/"****" 当成真实 Key 写盘，毁掉原值。
+	for i := range keys {
+		if strings.Contains(keys[i].Key, "[REDACTED]") || strings.Contains(keys[i].Key, "****") {
+			return gatewayValidationError(fmt.Sprintf("keys[%d]（%s）的 key 是脱敏占位符，不能保存；请填写真实 Key 或留空由网页自动生成", i, keys[i].Name))
+		}
 	}
 	g.Keys = keys
 	// 显式保存列表后旧单 Key 字段完成迁移使命：置空避免双入口混淆；
