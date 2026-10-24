@@ -177,7 +177,7 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 			upstreamCancel()
 			return nil, nil, err
 		}
-		backendHeaders(req, acc.Auth, prof)
+		backendHeaders(req, acc.authSnapshot(), prof)
 		if debugLoggingEnabled() {
 			req.Header.Set("X-Trace-ID", debugTraceID(r))
 			req.Header.Set("X-Parent-Request-ID", strconv.FormatUint(reqID, 10))
@@ -464,11 +464,21 @@ const (
 )
 
 // Profile 返回该账号对应的上游站点参数（国内站/国际站）。
+// 调用方须持有 accountMu（或能证明无并发写）；请求热路径请改用 authSnapshot。
 func (acc *Account) Profile() *upstreamProfile {
 	if acc.Auth != nil {
 		return profileForEdition(acc.Auth.Edition)
 	}
 	return profileForEdition(acc.Edition)
+}
+
+// authSnapshot 在 accountMu 保护下读取当前凭据指针。acc.Auth 的两个写方（凭据热加载、
+// 令牌刷新）都在 accountMu 下整体替换指针，且替换后不再修改旧对象，因此快照到的
+// 指针可跨锁安全使用；直接裸读该字段则与写方构成数据竞争。
+func (acc *Account) authSnapshot() *StoredAuth {
+	accountMu.Lock()
+	defer accountMu.Unlock()
+	return acc.Auth
 }
 
 // disabledMarker 是授权失效账号的持久化标记（凭据文件删除后用于控制台提示重新登录）。
@@ -3798,8 +3808,13 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			continue
 		}
 
-		// 按账号所属站点（国内站/国际站）路由上游与指纹 Header
-		prof := acc.Profile()
+		// 按账号所属站点（国内站/国际站）路由上游与指纹 Header。
+		// acc.Auth 由热加载/令牌刷新在 accountMu 下整体替换，必须在锁内取快照再读 Edition，
+		// 避免与写方构成数据竞争（与 doUpstreamRequest 内的 authSnapshot 各自独立快照）。
+		prof := profileForEdition(acc.Edition)
+		if sa := acc.authSnapshot(); sa != nil {
+			prof = profileForEdition(sa.Edition)
+		}
 
 		debugEvent(r, "info", "upstream_request_started", map[string]any{
 			"upstream_host": prof.Base,
