@@ -1,0 +1,6 @@
+install start
+[19:08:14] stopping running instances
+[19:08:16] installing service
+[19:08:17] starting service
+[19:08:25] service status=Running startType=Automatic
+[19:08:25] DONE

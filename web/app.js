@@ -162,6 +162,7 @@
     $("poolHealth").className = "health-value";
     $("poolHealthBar").style.width = "0%";
     $("poolHealthStatus").textContent = "等待账号状态";
+    if ($("poolStateDist")) $("poolStateDist").innerHTML = "";
     $("accountAlertsInfo").textContent = "登录后读取账号异常日志。";
     $("accountAlerts").innerHTML = '<p class="stats-empty">等待日志</p>';
     ["meta", "gatewayInfo", "logBox", "configBox", "tasksInfo"].forEach(function (id) {
@@ -237,6 +238,22 @@
     $("poolHealthStatus").textContent = data.stale ? "快照过旧 · 健康度待确认" :
       h.state === "empty" ? "未加载账号 · 暂无健康度" : !known ? "健康度待确认" :
       p === 100 ? "账号池全部可用" : p === 0 ? "账号池当前不可用，请查看告警" : "账号池部分受限，请查看告警";
+    // 状态分布：健康度只给一个比例，这里补充构成（可用/冷却/耗尽/过期/失效各多少），
+    // quota_exhausted 是 paid_exhausted 的历史别名，合并后展示。
+    var dist = $("poolStateDist");
+    if (dist) {
+      var counts = {};
+      (data.accounts || []).forEach(function (acc) {
+        var key = acc.state === "quota_exhausted" ? "paid_exhausted" : acc.state;
+        if (!STATE_TEXT[key]) key = "active";
+        counts[key] = (counts[key] || 0) + 1;
+      });
+      dist.innerHTML = ["active", "cooldown", "paid_exhausted", "expired", "disabled"].filter(function (k) {
+        return counts[k];
+      }).map(function (k) {
+        return '<span class="state-chip ' + STATE_CLASS[k] + '">' + esc(STATE_TEXT[k]) + " " + counts[k] + "</span>";
+      }).join("") || '<span class="state-chip">暂无账号</span>';
+    }
   }
 
   function renderAccountAlerts(data) {
@@ -673,7 +690,7 @@
       statsCard("总消耗 Token", s.tokenSamples ? statsNumber(s.tokens) : "—", "输入 " + statsNumber(s.inputTokens) +
         " · 输出 " + statsNumber(s.outputTokens) + " · 缓存读取 " + statsNumber(s.cachedTokens), "token") +
       statsCard("总消耗积分", s.creditSamples ? statsCredit(s.credits) : "—", (s.creditSamples || 0) + "/" + (s.requests || 0) + " 请求有积分 · 仅计 usage.credit", "credit") +
-      statsCard("账号调用次数", statsNumber(s.requests), "完整 " + statsNumber(s.success) + " · 失败 / 不完整 " + statsNumber(s.failed), "neutral") +
+      statsCard("请求成功率", s.requests ? ((s.success / s.requests) * 100).toFixed(1) + "%" : "—", "调用 " + statsNumber(s.requests) + " 次 · 完整 " + statsNumber(s.success) + " · 失败 / 不完整 " + statsNumber(s.failed), "neutral") +
       statsCard("平均总耗时", statsDuration(s.avgLatencyMs), coverage, "token") +
       statsCard("平均首Token (TTFT)", statsDuration(tokenTime(s)), (currentTTFT ? (s.ttftSamples || 0) : 0) + "/" + (s.requests || 0) + " 请求有新口径有效样本", "first");
     var chartBox = function (id) {
