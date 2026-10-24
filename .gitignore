@@ -50,3 +50,11 @@ tools/nssm-extract/
 tools/nssm.nupkg*
 tools/install-result.txt
 tools/model-probe*
+
+# 归档目录（历史备份不入库）
+archive/nssm-src/
+archive/exe-backups/
+archive/model-probe/
+archive/test-outputs/
+workbuddy-gateway.new.exe
+*.exe~
