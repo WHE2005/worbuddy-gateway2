@@ -142,8 +142,9 @@ func recordModelTTFT(model string, d time.Duration) {
 	}
 	modelStatsMu.Lock()
 	stat := modelStatLocked(model)
-	stat.bucketLocked(time.Now()).TTFTSum += d
-	stat.bucketLocked(time.Now()).TTFTSamples++
+	b := stat.bucketLocked(time.Now())
+	b.TTFTSum += d
+	b.TTFTSamples++
 	modelStatsMu.Unlock()
 }
 

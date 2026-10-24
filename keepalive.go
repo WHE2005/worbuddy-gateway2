@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -226,8 +227,17 @@ func keepaliveLoop() {
 	}
 }
 
+// keepaliveRunMu 串行化保活轮次：启动补跑与定时轮同时到达时后到者直接跳过，
+// 避免对同一批账号并发重复刷新（失败计数、调度日志和快照交错）。
+var keepaliveRunMu sync.Mutex
+
 // runKeepaliveOnce 串行刷新账号池；onlyOverdue 为真时只处理久未续期的账号。
 func runKeepaliveOnce(trigger string, onlyOverdue bool) {
+	if !keepaliveRunMu.TryLock() {
+		log.Printf("[续期保活] 阶段=跳过 触发方式=%s 原因=上一轮仍在执行 说明=补跑与定时轮不并发", trigger)
+		return
+	}
+	defer keepaliveRunMu.Unlock()
 	task := "keepalive"
 	next := nextKeepaliveTime(time.Now(), cfg.KeepaliveHours)
 	if onlyOverdue {

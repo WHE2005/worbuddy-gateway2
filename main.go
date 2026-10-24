@@ -2458,6 +2458,14 @@ func lockAccountWithContext(ctx context.Context, mu *sync.Mutex) bool {
 	}
 }
 
+// quotaScanBreaker 额度扫描熔断：连续多轮全部失败（上游宕机/网络故障）时退避跳过，
+// 避免每 5 分钟对 N 个账号各发一次注定失败的请求并刷日志；任何非全失败轮次即复位。
+var quotaScanBreaker struct {
+	sync.Mutex
+	consecutiveAllFailed int
+	lastRun              time.Time
+}
+
 func refreshAllAccountQuotas(ctx context.Context, done chan<- struct{}, schedule ...time.Time) {
 	defer close(done)
 	next := time.Time{}
@@ -2465,6 +2473,14 @@ func refreshAllAccountQuotas(ctx context.Context, done chan<- struct{}, schedule
 		next = schedule[0]
 	}
 	trace, started := startScheduledTask("quota_scan", next)
+	quotaScanBreaker.Lock()
+	if quotaScanBreaker.consecutiveAllFailed >= 2 && time.Since(quotaScanBreaker.lastRun) < 15*time.Minute {
+		quotaScanBreaker.Unlock()
+		logScheduledTask("quota_scan", "skipped", "circuit_open", trace, started, next, "连续多轮全部失败，退避跳过本轮，稍后自动恢复")
+		return
+	}
+	quotaScanBreaker.lastRun = time.Now()
+	quotaScanBreaker.Unlock()
 	accountMu.Lock()
 	accs := append([]*Account(nil), accounts...)
 	accountMu.Unlock()
@@ -2503,6 +2519,13 @@ func refreshAllAccountQuotas(ctx context.Context, done chan<- struct{}, schedule
 		status = "partial"
 	}
 	logScheduledTask("quota_scan", "completed", status, trace, started, next, fmt.Sprintf("账号=%d，已检查=%d，额度/套餐异常=%d，快照失败=%t", len(accs), processed, failed, snapshotErr != nil))
+	quotaScanBreaker.Lock()
+	if status == "failed" {
+		quotaScanBreaker.consecutiveAllFailed++
+	} else {
+		quotaScanBreaker.consecutiveAllFailed = 0
+	}
+	quotaScanBreaker.Unlock()
 }
 
 func backgroundQuotaRefresher() {
@@ -4275,7 +4298,11 @@ func streamChatResponse(w http.ResponseWriter, r *http.Request, resp *http.Respo
 			"saw_done":      sawDone,
 		})
 	}
-	observeModelCredit(acc, modelName, usage, reqID)
+	// 只用完整流学习模型收费属性：中断流的 usage 是部分样本，可能把中等长度
+	// 输出误标成免费/收费，进而影响零余额账号的调度决策；统计观测不受影响。
+	if scanErr == nil && finishReason != "" {
+		observeModelCredit(acc, modelName, usage, reqID)
+	}
 	statsObserveUsage(r, usage, scanErr == nil && finishReason != "")
 	recordModelTokens(modelName, usage, reqID)
 	recordModelLatency(modelName, time.Since(startTime))

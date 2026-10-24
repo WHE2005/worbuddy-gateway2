@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -103,6 +104,12 @@ func currentAdminKey() string {
 	return cfg.AdminKey
 }
 
+// adminKeyMatches 恒时比较两个管理 Key，统一替代各处散落的 != 直接比较，
+// 与鉴权中间件的 subtle.ConstantTimeCompare 保持同一标准。
+func adminKeyMatches(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
 // readGatewayDocumentLocked 保留其他配置段，不将提示词/账号规则重新构造为默认值。
 func readGatewayDocumentLocked() (map[string]json.RawMessage, gatewayFileConfig, []byte, error) {
 	data, err := os.ReadFile(runtimeConfigFile)
@@ -197,7 +204,7 @@ func saveGatewaySettings(enabled *bool, key string, apiPort, webPort *int, trace
 	if err != nil {
 		return err
 	}
-	if cfg.AdminKey == "" || g.AdminKey != cfg.AdminKey {
+	if cfg.AdminKey == "" || !adminKeyMatches(g.AdminKey, cfg.AdminKey) {
 		return errConfigChange
 	}
 	if enabled != nil {

@@ -17,6 +17,10 @@ var sensitiveSecrets sync.Map
 var (
 	namedSecretPattern  = regexp.MustCompile(`(?i)(\b(?:access[_-]?token|refresh[_-]?token|admin[_-]?key|api[_-]?key|x-api-key|x-refresh-token|authorization)\b["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'[^']*'|(?:Bearer[ \t]+)?[^\s,;}\[\]]+)`)
 	bearerSecretPattern = regexp.MustCompile(`(?i)(\bBearer[ \t]+)[A-Za-z0-9._~+/=-]+`)
+	// Cookie 头与 URL 查询参数里的会话凭据：未经 registerSecrets 注册的不透明
+	// token（如上游下发的 Set-Cookie、OAuth code）走结构化规则兜底。
+	cookieHeaderPattern = regexp.MustCompile(`(?i)\b(set-cookie|cookie)\s*:\s*[^\r\n]+`)
+	queryTokenPattern   = regexp.MustCompile(`(?i)([?&#](?:signature|sessionid|session|access_token|refresh_token|api_?key|token|ticket|code|sign|auth)=)[^&\s"']+`)
 )
 
 func registerSecrets(values ...string) {
@@ -73,6 +77,8 @@ func redactSensitiveText(text string) string {
 		return parts[1] + value
 	})
 	text = bearerSecretPattern.ReplaceAllString(text, "${1}[REDACTED]")
+	text = cookieHeaderPattern.ReplaceAllString(text, "${1}: [REDACTED]")
+	text = queryTokenPattern.ReplaceAllString(text, "${1}[REDACTED]")
 	return bearerLikeRe.ReplaceAllString(text, "[REDACTED]")
 }
 

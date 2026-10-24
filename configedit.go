@@ -106,7 +106,7 @@ func handleWebUIConfigEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 有效磁盘配置已修改管理 Key、但热加载尚未执行时，不能用旧会话覆盖它。
-	if onDisk, err := parseRuntimeConfig(old); err == nil && onDisk.Gateway.AdminKey != key {
+	if onDisk, err := parseRuntimeConfig(old); err == nil && !adminKeyMatches(onDisk.Gateway.AdminKey, key) {
 		writeAdminOperationError(w, r, "配置编辑", errConfigChange)
 		return
 	}
@@ -127,7 +127,7 @@ func handleWebUIConfigEdit(w http.ResponseWriter, r *http.Request) {
 		writeAdminOperationError(w, r, "配置编辑校验", err)
 		return
 	}
-	adminKeyChanged := c.Gateway.AdminKey != key
+	adminKeyChanged := !adminKeyMatches(c.Gateway.AdminKey, key)
 	if c.Gateway.AdminKey == "" && !input.ConfirmAdminKeyRemoval {
 		writeAdminOperationError(w, r, "配置编辑校验", gatewayValidationError("清空 gateway.adminKey 会使管理登录不可用，必须额外确认；可在服务器本机重新设置"))
 		return

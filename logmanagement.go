@@ -99,8 +99,13 @@ func (w *dailyLogWriter) Close() error {
 	return w.file.Close()
 }
 
-var managedLogPattern = regexp.MustCompile(`^(gateway-\d{4}-\d{2}-\d{2}\.log|debug-\d{4}-\d{2}-\d{2}\.jsonl|deployment-\d{4}-\d{2}-\d{2}\.jsonl|frontend-\d{4}-\d{2}-\d{2}\.log)$`)
+// managedLogPattern 受管日志白名单：网关自有日志之外，同时覆盖 build 审计日志与
+// NSSM 按大小轮转出的 service-stdout/stderr 历史（NSSM 只轮转不删除，没有代码兜底会无限堆积）。
+var managedLogPattern = regexp.MustCompile(`^(gateway-\d{4}-\d{2}-\d{2}\.log|debug-\d{4}-\d{2}-\d{2}\.jsonl|deployment-\d{4}-\d{2}-\d{2}\.jsonl|frontend-\d{4}-\d{2}-\d{2}\.log|build-\d{4}-\d{2}-\d{2}\.jsonl|service-(?:stdout|stderr)-\d{8}T\d{6}\.\d{3}\.log)$`)
 var logDatePattern = regexp.MustCompile(`\d{4}-\d{2}-\d{2}`)
+
+// NSSM 轮转文件名的时间戳形如 20261019T122350（本地时间）。
+var nssmLogDatePattern = regexp.MustCompile(`\d{8}T\d{6}`)
 
 type logCleanupResult struct {
 	RetentionDays int      `json:"retentionDays"`
@@ -179,7 +184,15 @@ func cleanupLogs(now time.Time, days int, trace string, schedule ...time.Time) (
 		if !entry.Type().IsRegular() || !managedLogPattern.MatchString(name) {
 			continue
 		}
-		date, parseErr := time.ParseInLocation("2006-01-02", logDatePattern.FindString(name), now.Location())
+		var date time.Time
+		var parseErr error
+		if stamp := logDatePattern.FindString(name); stamp != "" {
+			date, parseErr = time.ParseInLocation("2006-01-02", stamp, now.Location())
+		} else if stamp := nssmLogDatePattern.FindString(name); stamp != "" {
+			date, parseErr = time.ParseInLocation("20060102T150405", stamp, now.Location())
+		} else {
+			parseErr = errors.New("文件名不含可识别时间戳")
+		}
 		if parseErr != nil || !date.Before(cutoff) {
 			continue
 		}
@@ -244,7 +257,7 @@ func saveLogRetention(days int, trace string) error {
 	defer runtimeConfigMu.Unlock()
 	gatewayConfigMu.Lock()
 	doc, gateway, old, err := readGatewayDocumentLocked()
-	if err == nil && (cfg.AdminKey == "" || gateway.AdminKey != cfg.AdminKey) {
+	if err == nil && (cfg.AdminKey == "" || !adminKeyMatches(gateway.AdminKey, cfg.AdminKey)) {
 		err = errConfigChange
 	}
 	gatewayConfigMu.Unlock()

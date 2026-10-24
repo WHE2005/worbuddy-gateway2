@@ -63,7 +63,7 @@ func savePolicyToggle(kind, target string, enabled bool, trace string) error {
 	defer runtimeConfigMu.Unlock()
 	gatewayConfigMu.Lock()
 	doc, gateway, old, err := readGatewayDocumentLocked()
-	if err == nil && (cfg.AdminKey == "" || gateway.AdminKey != cfg.AdminKey) {
+	if err == nil && (cfg.AdminKey == "" || !adminKeyMatches(gateway.AdminKey, cfg.AdminKey)) {
 		err = errConfigChange
 	}
 	gatewayConfigMu.Unlock()

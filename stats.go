@@ -168,6 +168,12 @@ func restoreStatsAccountStatesLocked() {
 
 func loadOptionalStats() {
 	trace := newTraceID()
+	// 回收上次进程被杀留下的孤儿落盘临时文件（os.CreateTemp 的 .stats-*.tmp）
+	if matches, _ := filepath.Glob(".stats-*.tmp"); len(matches) > 0 {
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+	}
 	requestStats.Lock()
 	defer requestStats.Unlock()
 	requestStats.document = statsDocument{Schema: statsSchema, StartedAt: time.Now().UnixMilli(), Accounts: map[string]statsAccount{}, Requests: []statsRequest{}}
