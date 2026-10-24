@@ -387,6 +387,7 @@ type Config struct {
 	AuthExplicit       bool // 用户是否显式指定了 -auth（未指定时自动扫描目录下所有 workbuddy*.json）
 	LoginIntl          bool // login -intl：登录国际站 (www.workbuddy.ai，浏览器内完成登录)
 	APIKey             string
+	APIKeys            []APIKeyEntry // 多把模型 API Key（旧单 Key 已迁移为一把「默认」）
 	ProxyURL           string
 	Verbose            bool
 	DebugEnabled       bool   // 仅由工作目录 config.json 的 debug.enabled 控制

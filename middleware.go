@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"github.com/google/uuid"
 	"log"
 	"net/http"
@@ -96,6 +95,26 @@ func isAuthExemptPath(p string) bool {
 	return p == "/health" || p == "/ping" || p == "/"
 }
 
+// apiKeyScopeContextKey 携带命中 Key 的可用模型范围（nil/缺省 = 不限制）。
+type apiKeyScopeContextKey struct{}
+
+// apiKeyModelScope 返回当前请求命中的 API Key 的可用模型范围；nil/空 = 不限制。
+func apiKeyModelScope(r *http.Request) []string {
+	scope, _ := r.Context().Value(apiKeyScopeContextKey{}).([]string)
+	return scope
+}
+
+// modelInScope 判断模型是否在 Key 的可用范围内（忽略大小写与常见别名差异）。
+func modelInScope(scope []string, model string) bool {
+	m := normalizeModelName(model)
+	for _, allowed := range scope {
+		if normalizeModelName(allowed) == m {
+			return true
+		}
+	}
+	return false
+}
+
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		apiKey := currentAPIKey()
@@ -106,7 +125,8 @@ func authMiddleware(next http.Handler) http.Handler {
 			if token == "" {
 				token = r.Header.Get("x-api-key")
 			}
-			if subtle.ConstantTimeCompare([]byte(token), []byte(apiKey)) != 1 {
+			entry, ok := matchAPIKey(token)
+			if !ok {
 				debugEvent(r, "warn", "authentication_rejected", map[string]any{
 					"status_code":     http.StatusUnauthorized,
 					"reason":          "invalid_api_key",
@@ -115,6 +135,9 @@ func authMiddleware(next http.Handler) http.Handler {
 				log.Printf("[请求被拦截] traceId=%s 拦截层=API鉴权 结果=拒绝 原因=未提供有效API密钥 返回状态码=401 业务影响=请求未进入业务方法", w.Header().Get("X-Trace-ID"))
 				writeUpstreamError(w, r, http.StatusUnauthorized, "invalid_api_key", "未提供有效 API 密钥")
 				return
+			}
+			if len(entry.Models) > 0 {
+				r = r.WithContext(context.WithValue(r.Context(), apiKeyScopeContextKey{}, entry.Models))
 			}
 		}
 		debugEvent(r, "debug", "authentication_passed", map[string]any{"result": "allowed"})

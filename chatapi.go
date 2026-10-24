@@ -27,6 +27,16 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 	traceID := w.Header().Get("X-Trace-ID")
 	log.Printf("[业务入口] traceId=%s requestId=%d 业务=上游模型调用 请求体字节数=%d", traceID, reqID, len(upstreamBytes))
 	recordModelRequest(modelName)
+	// API Key 可用范围：被限制的模型对该 Key 表现为「不存在」，未调用上游。
+	if scope := apiKeyModelScope(r); len(scope) > 0 && !modelInScope(scope, modelName) {
+		log.Printf("[请求被拦截] traceId=%s requestId=%d 拦截层=Key可用范围 模型=%s 结果=拒绝 返回状态码=403 业务影响=未进入上游", traceID, reqID, modelName)
+		debugEvent(r, "warn", "model_rejected_by_key_scope", map[string]any{
+			"status_code": http.StatusForbidden, "model": modelName, "business_impact": "未调用上游模型",
+		})
+		recordModelFailure(modelName, "Key范围拒绝")
+		writeUpstreamError(w, r, http.StatusForbidden, "model_not_available_for_key", fmt.Sprintf("当前 API Key 无权使用模型 %s", modelName))
+		return nil, nil, nil, false
+	}
 	accountMu.Lock()
 	poolSize := len(accounts)
 	accountMu.Unlock()
@@ -506,8 +516,13 @@ func writeChatAggregate(w http.ResponseWriter, r *http.Request, resp *http.Respo
 
 func handleModels(w http.ResponseWriter, r *http.Request) {
 	modelIDs, source := mergedModelIDs()
+	// Key 可用范围：被限制的模型对该 Key 表现为「不存在」，直接从列表剔除。
+	scope := apiKeyModelScope(r)
 	modelsList := make([]map[string]any, 0, len(modelIDs))
 	for _, id := range modelIDs {
+		if len(scope) > 0 && !modelInScope(scope, id) {
+			continue
+		}
 		entry := map[string]any{
 			"id": id, "object": "model", "owned_by": "workbuddy", "permission": []any{},
 		}

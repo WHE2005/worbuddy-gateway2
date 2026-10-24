@@ -4,7 +4,8 @@
     "webPort": 8316,
     "adminKey": "",
     "apiKeyEnabled": false,
-    "apiKey": ""
+    "apiKey": "",
+    "keys": []
   },
   "systemPrompt": {
     "fallback": "",

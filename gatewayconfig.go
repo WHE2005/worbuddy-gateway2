@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -9,7 +10,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -19,11 +22,22 @@ const (
 
 // Key 按用户配置以明文落盘；APIKeyEnabled 只影响模型 API，绝不能关闭管理鉴权。
 type gatewayFileConfig struct {
-	APIPort       int    `json:"apiPort"`
-	WebPort       int    `json:"webPort"`
-	AdminKey      string `json:"adminKey"`
-	APIKeyEnabled bool   `json:"apiKeyEnabled"`
-	APIKey        string `json:"apiKey"`
+	APIPort       int           `json:"apiPort"`
+	WebPort       int           `json:"webPort"`
+	AdminKey      string        `json:"adminKey"`
+	APIKeyEnabled bool          `json:"apiKeyEnabled"`
+	APIKey        string        `json:"apiKey"` // 旧单 Key 字段：读取时自动迁移为一把「默认」Key，仅作回滚兼容保留
+	Keys          []APIKeyEntry `json:"keys"`
+}
+
+// APIKeyEntry 是一把可独立启停、可限制可用模型范围的模型 API Key。
+type APIKeyEntry struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Key       string   `json:"key"`
+	CreatedAt int64    `json:"createdAt"`
+	Enabled   bool     `json:"enabled"`
+	Models    []string `json:"models,omitempty"` // 空/缺省 = 不限制；非空 = 只允许这些模型
 }
 
 type gatewayValidationError string
@@ -35,6 +49,11 @@ var (
 	gatewaySettings gatewayFileConfig
 	errSetupDone    = errors.New("管理 Key 已配置；外部修改后请等待配置热加载并重新登录")
 	errConfigChange = errors.New("管理 Key 已被外部修改，请等待配置热加载并使用新 Key 重新登录")
+)
+
+const (
+	maxAPIKeys        = 50
+	maxKeyModelsScope = 100
 )
 
 func normalizeGatewayConfig(g gatewayFileConfig) (gatewayFileConfig, error) {
@@ -57,10 +76,71 @@ func normalizeGatewayConfig(g gatewayFileConfig) (gatewayFileConfig, error) {
 			}
 		}
 	}
-	if g.APIKeyEnabled && g.APIKey == "" {
-		return g, gatewayValidationError("启用 API Key 校验时必须设置 gateway.apiKey")
+	// 旧单 Key 配置自动迁移为一把「默认」Key；ID 由 Key 内容派生，重复加载结果一致。
+	if len(g.Keys) == 0 && g.APIKey != "" {
+		sum := sha256.Sum256([]byte(g.APIKey))
+		g.Keys = []APIKeyEntry{{ID: "legacy-" + hex.EncodeToString(sum[:4]), Name: "默认",
+			Key: g.APIKey, CreatedAt: time.Now().Unix(), Enabled: true}}
+	}
+	seenIDs := map[string]bool{}
+	seenKeys := map[string]bool{}
+	for i := range g.Keys {
+		k := &g.Keys[i]
+		if k.ID == "" {
+			return g, gatewayValidationError(fmt.Sprintf("gateway.keys[%d].id 不能为空", i))
+		}
+		if seenIDs[k.ID] {
+			return g, gatewayValidationError(fmt.Sprintf("gateway.keys[%d].id 重复: %s", i, k.ID))
+		}
+		seenIDs[k.ID] = true
+		if strings.TrimSpace(k.Name) == "" {
+			k.Name = "未命名 Key"
+		}
+		if len([]rune(k.Name)) > 64 {
+			return g, gatewayValidationError(fmt.Sprintf("gateway.keys[%d].name 最长 64 字符", i))
+		}
+		for _, c := range k.Key {
+			if c < 33 || c > 126 {
+				return g, gatewayValidationError(fmt.Sprintf("gateway.keys[%d].key 只能包含非空白可打印 ASCII 字符", i))
+			}
+		}
+		if k.Key == "" || len(k.Key) > 128 {
+			return g, gatewayValidationError(fmt.Sprintf("gateway.keys[%d].key 必须为 1～128 个字符", i))
+		}
+		if seenKeys[k.Key] {
+			return g, gatewayValidationError(fmt.Sprintf("gateway.keys[%d].key 与其他 Key 重复", i))
+		}
+		seenKeys[k.Key] = true
+		models := make([]string, 0, len(k.Models))
+		seenModels := map[string]bool{}
+		for _, m := range k.Models {
+			if m = normalizeModelName(m); m == "" || seenModels[m] {
+				continue
+			}
+			seenModels[m] = true
+			models = append(models, m)
+		}
+		if len(models) > maxKeyModelsScope {
+			return g, gatewayValidationError(fmt.Sprintf("gateway.keys[%d].models 超过 %d 个上限", i, maxKeyModelsScope))
+		}
+		k.Models = models
+	}
+	if len(g.Keys) > maxAPIKeys {
+		return g, gatewayValidationError(fmt.Sprintf("gateway.keys 超过 %d 把上限", maxAPIKeys))
+	}
+	if g.APIKeyEnabled && !hasEnabledAPIKey(g) {
+		return g, gatewayValidationError("启用 API Key 校验时至少需要一把「启用」状态的 Key（或旧版 gateway.apiKey）")
 	}
 	return g, nil
+}
+
+func hasEnabledAPIKey(g gatewayFileConfig) bool {
+	for _, k := range g.Keys {
+		if k.Enabled {
+			return true
+		}
+	}
+	return g.APIKey != ""
 }
 
 func applyGatewayConfig(g gatewayFileConfig) error {
@@ -86,10 +166,42 @@ func applyGatewayConfig(g gatewayFileConfig) error {
 func setGatewayKeysLocked(g gatewayFileConfig) {
 	registerSecrets(g.AdminKey, g.APIKey)
 	cfg.AdminKey = g.AdminKey
+	cfg.APIKeys = append([]APIKeyEntry(nil), g.Keys...)
 	cfg.APIKey = ""
 	if g.APIKeyEnabled {
-		cfg.APIKey = g.APIKey
+		// 兼容 probe CLI 等旧调用方：取第一把「启用」的 Key 作为当前 Key。
+		for _, k := range cfg.APIKeys {
+			if k.Enabled {
+				cfg.APIKey = k.Key
+				break
+			}
+		}
+		if cfg.APIKey == "" && g.APIKey != "" {
+			cfg.APIKey = g.APIKey
+		}
 	}
+	for _, k := range cfg.APIKeys {
+		registerSecrets(k.Key)
+	}
+}
+
+// matchAPIKey 恒时匹配请求令牌；命中返回该把 Key（Models 非空表示限制了可用模型范围）。
+// 旧单 Key 配置在 normalize 阶段已迁移进 Keys，这里保留 legacy 兜底以防极端时序。
+func matchAPIKey(token string) (APIKeyEntry, bool) {
+	gatewayConfigMu.RLock()
+	defer gatewayConfigMu.RUnlock()
+	if token == "" {
+		return APIKeyEntry{}, false
+	}
+	for _, k := range cfg.APIKeys {
+		if k.Enabled && subtle.ConstantTimeCompare([]byte(token), []byte(k.Key)) == 1 {
+			return k, true
+		}
+	}
+	if len(cfg.APIKeys) == 0 && cfg.APIKey != "" && subtle.ConstantTimeCompare([]byte(token), []byte(cfg.APIKey)) == 1 {
+		return APIKeyEntry{Name: "默认"}, true
+	}
+	return APIKeyEntry{}, false
 }
 
 func currentAPIKey() string {
