@@ -23,6 +23,34 @@ const statsFile = "stats.json"
 const statsSchema = 1
 const statsMaxFileBytes = 64 << 20
 
+// 请求记录保留策略：flush 前按时间窗口与条数上限裁剪，防止长期运行时
+// stats.json 与内存无界增长（旧行为：达到 64MB 上限后永久拒绝写盘、记录只增不减）。
+const (
+	statsRetentionDays = 30
+	statsMaxRequests   = 100000
+)
+
+// pruneStatsLocked 按时间窗口与条数上限裁剪请求记录，返回丢弃条数。
+// 记录按完成时间（At，Unix 毫秒）追加写入，完成顺序近似时间序，二分找窗口起点即可。
+// 调用方持有 requestStats.Lock；仅在即将落盘的 flush 中调用，裁剪结果随本次写入一并生效。
+func pruneStatsLocked(now time.Time) int {
+	doc := &requestStats.document
+	if len(doc.Requests) == 0 {
+		return 0
+	}
+	dropped := 0
+	cutoff := now.AddDate(0, 0, -statsRetentionDays).UnixMilli()
+	if start := sort.Search(len(doc.Requests), func(i int) bool { return doc.Requests[i].At >= cutoff }); start > 0 {
+		doc.Requests = append(doc.Requests[:0], doc.Requests[start:]...)
+		dropped += start
+	}
+	if overflow := len(doc.Requests) - statsMaxRequests; overflow > 0 {
+		doc.Requests = append(doc.Requests[:0], doc.Requests[overflow:]...)
+		dropped += overflow
+	}
+	return dropped
+}
+
 // 只记录统计事实，不记录凭据、请求/响应正文、提示词或令牌。
 // identity 是账号身份摘要，避免同一文件换成另一个账号后继承旧模型阻断。
 type statsAccount struct {
@@ -215,6 +243,9 @@ func flushOptionalStats() error {
 		return nil
 	}
 	revision := requestStats.revision
+	if dropped := pruneStatsLocked(time.Now()); dropped > 0 {
+		log.Printf("[统计文件] traceId=%s 阶段=裁剪 结果=成功 丢弃记录=%d 保留窗口=%d天 上限=%d条 业务影响=防止统计无界增长，聚合汇总不受影响", newTraceID(), dropped, statsRetentionDays, statsMaxRequests)
+	}
 	raw, err := json.Marshal(requestStats.document)
 	requestStats.Unlock()
 	if err == nil && len(raw) > statsMaxFileBytes {

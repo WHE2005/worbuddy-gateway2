@@ -12,6 +12,7 @@ import (
 //
 // 清空除登录凭据（workbuddy*.json）以外的全部本地数据：
 //   - 状态快照 workbuddy-status.json
+//   - 请求统计 stats.json（含落盘临时文件）
 //   - 签到尝试状态 workbuddy-checkin-state.json
 //   - 模型缓存 wb-models-cache.json（含倍率与价格探测结论）
 //   - 失效标记 *.disabled / *.json.disabled
@@ -37,13 +38,22 @@ func runReset() {
 		}
 	}
 
-	// 1. 状态快照与模型缓存（含临时文件）
+	// 1. 状态快照、请求统计与模型缓存（含临时文件）
 	for _, f := range []string{
 		statusSnapshotFile, statusSnapshotFile + ".tmp",
 		checkinStateFile, checkinStateFile + ".tmp",
 		modelsCacheFile, modelsCacheFile + ".tmp",
+		statsFile, statsFile + ".tmp",
 	} {
 		removeIfExists(f, "")
+	}
+	// stats 落盘用 os.CreateTemp(".", ".stats-*.tmp")，进程被杀会留下孤儿临时文件
+	if entries, err := os.ReadDir("."); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasPrefix(e.Name(), ".stats-") && strings.HasSuffix(e.Name(), ".tmp") {
+				removeIfExists(e.Name(), "统计临时文件")
+			}
+		}
 	}
 
 	// 2. 失效标记：显式凭据路径对应的标记文件
