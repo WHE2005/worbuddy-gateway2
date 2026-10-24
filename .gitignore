@@ -1,0 +1,52 @@
+# 凭据与敏感数据（切勿提交！）
+workbuddy*.json
+workbuddy-console.json
+last-*.json
+*.json.bak
+*.json.disabled
+*.disabled
+.workbuddy-*.json
+wb-models-cache.json
+wb-models-cache.json.tmp
+config.json
+stats.json
+.env
+.env.*
+!.env.example
+!.env.sample
+.netrc
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+.ssh/
+backups/
+
+# 本地编译产物
+workbuddy-gateway
+workbuddy-gateway.exe
+dist/
+
+# 日志与临时文件
+*.log
+logs/
+*.tmp
+.DS_Store
+Thumbs.db
+
+# 本地工具缓存、历史材料与可能包含环境信息的报告
+.codex-tmp/
+.playwright-mcp/
+docs/local/
+archive/local/
+
+# 本地构建/测试产物与历史备份（补充）
+*.bak
+*.out
+workbuddy-gateway.exe*
+tools/nssm-extract/
+tools/nssm.nupkg*
+tools/install-result.txt
+tools/model-probe*
