@@ -1480,7 +1480,7 @@ func modelPriceProbeOnce() {
 		}
 	}
 	if done > 0 {
-		writeStatusSnapshot()
+		requestStatusSnapshotRefresh()
 	}
 	status := "success"
 	if done == 0 {

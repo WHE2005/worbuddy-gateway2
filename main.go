@@ -115,6 +115,11 @@ var (
 // 以及 Go 在复用 keep-alive 连接时常见的 "server closed idle connection"。
 // 注意：context.Canceled 与 DeadlineExceeded 不属于此类——前者是客户端主动断开，
 // 后者是明确超时，重试都无意义甚至有害。
+// errUpstreamNotSent 标记「请求确认未发到上游」（连接被拒、DNS 失败、重试耗尽且
+// 请求头/请求体均未写出）。此时换下一个账号重试不会重复计费；包装保留原始错误链，
+// errors.Is(err, io.EOF) 等既有判定不受影响。
+var errUpstreamNotSent = errors.New("upstream request not sent")
+
 func isTransientNetworkError(err error) bool {
 	if err == nil {
 		return false
@@ -220,7 +225,12 @@ func doUpstreamRequest(r *http.Request, acc *Account, prof *upstreamProfile, ups
 			}
 		}
 	}
-	return nil, nil, lastErr
+	if lastErr == nil {
+		lastErr = errors.New("upstream unavailable")
+	}
+	// 重试耗尽仍失败，且历次尝试都未写出请求头/请求体：可安全换号，
+	// 包装哨兵供 upstreamChat 在账号池内轮转；%w 保留原始错误链。
+	return nil, nil, fmt.Errorf("%w: %w", errUpstreamNotSent, lastErr)
 }
 
 // -----------------------------------------------------------------------------
@@ -431,8 +441,9 @@ type Account struct {
 	fingerprint    string                        // 凭据文件变更指纹（mtime+size，凭据热加载用）
 	lock           sync.Mutex                    // 单账号串行锁（防止同账号并发触发 11128）
 	// 续期失败计数（仅内存，重启清零）：单次失败可能是上游抖动，连续失败才判定登录态失效。
-	RefreshFailCount int
-	LastRefreshError string
+	RefreshFailCount  int
+	LastRefreshError  string
+	LastRefreshFailAt time.Time // 最近一次续期失败时刻；间隔超过 refreshFailDecayWindow 时计数清零重计
 }
 
 const (
@@ -760,10 +771,17 @@ func initHTTPClient() {
 	jar, _ := cookiejar.New(nil)
 	headerTimeout, _, _ := upstreamSettings()
 	transport := &http.Transport{
+		// 显式启用 HTTP/2：设置非 nil TLSClientConfig 后标准库默认退回 HTTP/1.1，
+		// 高并发下无法多路复用。上游返回 goaway 的瞬时错误本来就按可重试处理。
+		ForceAttemptHTTP2:   true,
 		MaxIdleConns:        50,
 		IdleConnTimeout:     90 * time.Second,
 		MaxIdleConnsPerHost: 10,
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
+		// 拨号与 TLS 握手给明确上限：对端黑洞时不再依赖 OS 默认超时。
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
 		// 只约束到「收到响应头」为止；流式响应体的长时间传输由 upstreamIdleTimeout 的空闲看门狗保护。
 		ResponseHeaderTimeout: headerTimeout,
 	}
@@ -1251,7 +1269,7 @@ func accountReloaderLoop() {
 		started := time.Now()
 		changed, err := reloadAccountsResult()
 		if changed {
-			writeStatusSnapshot() // 立即刷新 monitor 状态文件
+			requestStatusSnapshotRefresh() // 立即刷新 monitor 状态文件
 			requestQuotaScan()
 			// 目录刷新成功后会自动触发价格探测；这里再直接触发一次，
 			// 保证「原本没有某站点账号、后来加入」时也能立刻对该站点模型探测。
@@ -1457,7 +1475,7 @@ func markModelCooldown(acc *Account, model string, until time.Time, msg string) 
 	state.LastReason = msg
 	accountMu.Unlock()
 	log.Printf("[ModelCooldown] 账号 %s 模型 %s 触发模型级频率限制，仅屏蔽该模型至 %s；其他模型仍可调度", acc.Path, model, until.Format("2006-01-02 15:04:05"))
-	writeStatusSnapshot()
+	requestStatusSnapshotRefresh()
 }
 
 // markModelQuotaBlocked 记录一次「账号额度耗尽」观测。
@@ -1476,7 +1494,7 @@ func markModelQuotaBlocked(acc *Account, model, msg string) {
 	accountMu.Unlock()
 	log.Printf("[ModelQuota] 账号 %s 模型 %s 返回额度耗尽(14018)：仅阻断该账号对该模型的调度，账号额度恢复后自动解除；模型收费属性保持=%s，未被本次错误覆盖",
 		acc.Path, model, ifEmpty(oldClass, modelCostUnknown))
-	writeStatusSnapshot()
+	requestStatusSnapshotRefresh()
 }
 
 // disableAccount 将账号标记为失效（授权过期/撤销），禁止调度并删除凭据文件，
@@ -1522,14 +1540,14 @@ func disableAccount(acc *Account, reason string) {
 	if keep, note := credentialStillUsableForDelete(authSnapshot); keep {
 		log.Printf("[Auth] 账号 %s 已停止调度；%s；凭据文件保留在 %s（如需彻底移除请手动删除），重新登录会自动覆盖",
 			path, note, path)
-		writeStatusSnapshot()
+		requestStatusSnapshotRefresh()
 		return
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		log.Printf("[Auth] 账号 %s 凭据文件删除失败: %v", path, err)
 	}
 	log.Printf("[Auth] 账号 %s 授权失效，已禁止调度并删除凭据文件（删除前只读校验确认不可用）: %s", path, reason)
-	writeStatusSnapshot()
+	requestStatusSnapshotRefresh()
 }
 
 // loadDisabledMarkers 扫描失效标记文件，将其恢复为账号池中的失效账号（Auth 为 nil）。
@@ -1878,7 +1896,7 @@ func refreshAccountToken(acc *Account, reason string) error {
 	}
 	log.Printf("[Auth] 账号 %s Token 刷新成功，访问令牌过期时间由 %s 更新为 %s，触发方式=%s，凭据已安全写回",
 		path, time.Unix(oldExpiresAt, 0).Format("2006-01-02 15:04:05"), time.Unix(newExpiresAt, 0).Format("2006-01-02 15:04:05"), reason)
-	writeStatusSnapshot()
+	requestStatusSnapshotRefresh()
 	return nil
 }
 
@@ -1886,9 +1904,86 @@ func refreshAccountToken(acc *Account, reason string) error {
 func recordRefreshFailure(acc *Account, summary string) int {
 	accountMu.Lock()
 	defer accountMu.Unlock()
+	now := time.Now()
+	// 时间衰减：距上次失败超过窗口按全新一轮计，避免分散的临时故障累积成永久禁号。
+	if !acc.LastRefreshFailAt.IsZero() && now.Sub(acc.LastRefreshFailAt) > refreshFailDecayWindow {
+		acc.RefreshFailCount = 0
+	}
+	acc.LastRefreshFailAt = now
 	acc.RefreshFailCount++
 	acc.LastRefreshError = summary
 	return acc.RefreshFailCount
+}
+
+// disabledAccountRecheckInterval 周期复检被禁用账号的间隔。
+const disabledAccountRecheckInterval = 30 * time.Minute
+
+// disabledAccountRecheckLoop 周期复检被禁用账号：因「令牌刷新连续失败」被禁用的
+// 账号，凭据文件仍在时每 30 分钟尝试一次真实刷新，上游恢复即自动回到账号池，
+// 不再依赖用户重新登录。失败保持禁用，失败计数照常累计（受衰减窗口约束）。
+func disabledAccountRecheckLoop() {
+	ticker := time.NewTicker(disabledAccountRecheckInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		accountMu.Lock()
+		var candidates []*Account
+		for _, acc := range accounts {
+			if acc.Disabled && acc.Auth != nil {
+				candidates = append(candidates, acc)
+			}
+		}
+		accountMu.Unlock()
+		for _, acc := range candidates {
+			recheckDisabledAccount(acc)
+		}
+	}
+}
+
+// recheckDisabledAccount 对单个被禁用账号做一次真实刷新尝试；成功则恢复调度。
+// 与该账号的请求/续期串行（acc.lock），覆盖前校验与磁盘写入复用既有刷新纪律。
+func recheckDisabledAccount(acc *Account) bool {
+	acc.lock.Lock()
+	defer acc.lock.Unlock()
+
+	accountMu.Lock()
+	if !acc.Disabled || acc.Auth == nil {
+		disabled := acc.Disabled
+		accountMu.Unlock()
+		return !disabled
+	}
+	refreshed := *acc.Auth
+	path := acc.Path
+	accountMu.Unlock()
+	oldTokens := refreshed.Auth
+
+	if _, err := refreshTokenPayload(&refreshed); err != nil {
+		return false
+	}
+	if err := validateRefreshedCredential(path, &refreshed, oldTokens); err != nil {
+		log.Printf("[Auth] 账号 %s 禁用复检刷新成功但未通过覆盖前校验，保持禁用: %v", path, err)
+		return false
+	}
+	if err := saveAuthTo(path, &refreshed); err != nil {
+		log.Printf("[Auth] 账号 %s 禁用复检刷新成功但写回凭据失败，保持禁用: %v", path, err)
+		return false
+	}
+	accountMu.Lock()
+	defer accountMu.Unlock()
+	if !acc.Disabled {
+		return true
+	}
+	acc.Auth = &refreshed
+	acc.Edition = profileForEdition(refreshed.Edition).Key
+	if st, statErr := os.Stat(path); statErr == nil {
+		acc.fingerprint = accountFingerprint(st)
+	}
+	acc.Disabled = false
+	acc.DisabledReason = ""
+	acc.RefreshFailCount = 0
+	acc.LastRefreshError = ""
+	log.Printf("[Auth] 账号 %s 周期复检成功，已自动恢复调度 说明=历史失效多为上游临时故障或令牌过期，凭据文件与失效标记已同步更新", path)
+	requestStatusSnapshotRefresh()
+	return true
 }
 
 // refreshTokenPayload 调用上游刷新接口并更新内存中的令牌字段（不落盘）。
@@ -2229,7 +2324,7 @@ func observeModelCredit(acc *Account, model string, usage map[string]any, reqID 
 	} else if oldClass != modelCostPaid {
 		log.Printf("[ModelCost] requestId=%d 账号 %s 站点=%s 模型 %s 实测 usage.credit=%s，已学习为收费模型", reqID, path, site, model, formatQuota(credit))
 	}
-	writeStatusSnapshot()
+	requestStatusSnapshotRefresh()
 }
 
 // refreshAccountQuota 通过用户中心只读计费接口刷新账号额度，不记录或回传 Token。
@@ -3186,6 +3281,19 @@ func renderAccountTable(accs []accountSnapshot) string {
 }
 
 // statusSnapshotLoop serve 后台每 3 秒刷新一次状态快照。
+// statusSnapshotKick 常驻快照协程的唤醒信号；容量 1，多次提醒合并为一次。
+var statusSnapshotKick = make(chan struct{}, 1)
+
+// requestStatusSnapshotRefresh 请求/刷新路径的快照刷新入口（异步）。
+// 全量快照要持 accountMu 构建并写盘：429 风暴时逐请求同步执行会放大阻塞并拖慢选号，
+// 令牌刷新路径还会在 acc.lock 内写盘。这里只发非阻塞信号，由快照协程承担成本。
+func requestStatusSnapshotRefresh() {
+	select {
+	case statusSnapshotKick <- struct{}{}:
+	default: // 已有未处理的提醒，合并
+	}
+}
+
 func statusSnapshotLoop() {
 	var lastLogged time.Time
 	var previousStatus string
@@ -3201,8 +3309,14 @@ func statusSnapshotLoop() {
 	write(time.Now().Add(3 * time.Second))
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-	for tick := range ticker.C {
-		write(tick.Add(3 * time.Second))
+	for {
+		select {
+		case tick := <-ticker.C:
+			write(tick.Add(3 * time.Second))
+		case <-statusSnapshotKick:
+			// 请求/刷新路径的异步提醒：尽快落盘一次，但不亲自承担快照成本
+			write(time.Now().Add(3 * time.Second))
+		}
 	}
 }
 
@@ -3423,6 +3537,8 @@ func runServe() {
 	safeGoLoop("keepalive", keepaliveLoop)
 	safeGoLoop("quota_refresher", backgroundQuotaRefresher)
 	safeGoLoop("daily_checkin", backgroundDailyCheckin)
+	// 周期复检被禁用账号：上游恢复即自动回到账号池，不再依赖用户重新登录
+	safeGoLoop("disabled_recheck", disabledAccountRecheckLoop)
 	if cfg.ModelsRefresh > 0 {
 		safeGoLoop("model_catalog_refresh", func() { modelsRefreshLoop(time.Duration(cfg.ModelsRefresh) * time.Minute) })
 	} else {
@@ -3745,8 +3861,16 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 
 	var lastRateErr string
 	var lastAuthErr string
+	var lastNetErr error
 	attempted := make(map[*Account]bool, poolSize)
-	for attempt := 0; attempt < poolSize; attempt++ {
+	// 池大小每轮重读：凭据热加载新增的账号也能参与本次请求的换号轮转。
+	for attempt := 0; ; attempt++ {
+		accountMu.Lock()
+		nowPoolSize := len(accounts)
+		accountMu.Unlock()
+		if attempt >= nowPoolSize {
+			break
+		}
 		acc, selection, err := nextAccountForModel(modelName, attempted)
 		if err != nil {
 			if errors.Is(err, errModelAccountPolicy) {
@@ -3822,8 +3946,15 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			"payload_bytes": len(upstreamBytes),
 		})
 		// 注入 CodeBuddy 凭据与指纹 Header
-		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控
-		acc.lock.Lock()
+		// 限制同一账号向腾讯上游的请求严格单并发串行排队，防止并发双发触发腾讯风控。
+		// 带客户端 ctx 排队：客户端已断开就不再等该账号的串行队列（后台刷新/签到
+		// 最长可占锁数分钟），直接结束本次请求。
+		if !lockAccountWithContext(r.Context(), &acc.lock) {
+			debugEvent(r, "info", "account_queue_cancelled", map[string]any{
+				"business_impact": "客户端已取消，未再等待账号串行队列，未调用上游",
+			})
+			return nil, nil, nil, false
+		}
 		statsSelectAccount(r, acc, modelName)
 		resp, upstreamCancel, err := doUpstreamRequest(r, acc, prof, upstreamBytes, reqID, traceID)
 		acc.lock.Unlock()
@@ -3836,6 +3967,13 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 			log.Printf("[异常] traceId=%s requestId=%d 发生阶段=上游网络调用 账号=%s 异常=%v 业务影响=本次模型请求失败 是否已处理=是", traceID, reqID, acc.Path, err)
 			log.Printf("[#%d] 账号 %s [%s] 上游请求失败: %v", reqID, acc.Path, prof.Label, err)
 			recordModelFailure(modelName, "网络错误")
+			// 请求确认未发出（连接被拒/DNS 失败等）：换下一个账号不会重复计费。
+			// 已写出请求头的错误仍直接 502，避免向上游重放 POST。
+			if errors.Is(err, errUpstreamNotSent) && r.Context().Err() == nil {
+				lastNetErr = err
+				log.Printf("[#%d] 账号 %s 网络错误且请求未发出，换下一账号重试", reqID, acc.Path)
+				continue
+			}
 			writeUpstreamError(w, r, http.StatusBadGateway, "upstream_network_error", fmt.Sprintf("网络转发失败: %v", err))
 			return nil, nil, nil, false
 		}
@@ -3920,7 +4058,15 @@ func upstreamChat(w http.ResponseWriter, r *http.Request, reqID uint64, modelNam
 		return resp, acc, prof, true
 	}
 
-	// 理论上不可达（poolSize 次尝试后未成功即已在循环内返回）
+	// 所有账号的请求都未能发出（连接层失败，如断网/DNS 故障）：如实回 502，
+	// 不伪装成 429 冷却——客户端需要区分「服务不可用」与「触发限流」。
+	if lastNetErr != nil {
+		writeUpstreamError(w, r, http.StatusBadGateway, "upstream_network_error",
+			fmt.Sprintf("网络转发失败（已轮询 %d 个账号）: %v", len(attempted), lastNetErr))
+		return nil, nil, nil, false
+	}
+
+	// 所有账号均因冷却/额度/失效被跳过
 	recordModelFailure(modelName, "all_cooldown")
 	debugEvent(r, "warn", "request_rejected_all_cooldown", map[string]any{
 		"status_code":     http.StatusTooManyRequests,

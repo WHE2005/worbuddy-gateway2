@@ -30,6 +30,10 @@ const (
 	// refreshDisableThreshold 连续刷新失败多少次才判定登录态失效。
 	// 单次失败可能是上游抖动、风控或网络问题，一次就删凭据属于误杀。
 	refreshDisableThreshold = 3
+
+	// refreshFailDecayWindow 失败计数衰减窗口：失败分散在不同天（如多个夜间断网
+	// 各撞上一次续期）不该累计成永久禁号，只有窗口内的连续失败才逼近阈值。
+	refreshFailDecayWindow = 24 * time.Hour
 )
 
 // refreshFailureKind 区分「登录态真的没了」和「这次只是没成功」。
@@ -292,7 +296,7 @@ func runKeepaliveOnce(trigger string, onlyOverdue bool) {
 	}
 	logScheduledTask(task, "completed", status, trace, started, next, fmt.Sprintf("触发=%s，成功=%d，失败=%d，跳过=%d，失效=%d", trigger, refreshed, failed, skipped, disabled))
 	if refreshed > 0 || disabled > 0 {
-		writeStatusSnapshot()
+		requestStatusSnapshotRefresh()
 	}
 }
 

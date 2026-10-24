@@ -48,6 +48,8 @@ func prepareGatewayServers() ([]*http.Server, []net.Listener, error) {
 		ReadTimeout: 120 * time.Second,
 		// 保留模型流无总写入时限，不把管理端限制扩散到模型 API。
 		WriteTimeout: 0,
+		// 回收 keep-alive 空闲连接，避免长期运行后 fd 缓慢堆积。
+		IdleTimeout: 120 * time.Second,
 	}}
 	if cfg.WebUI {
 		servers = append(servers, &http.Server{

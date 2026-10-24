@@ -157,7 +157,7 @@ func handleAdminProbe(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[Probe] 账号 %s [%s] 模型 %s -> %s (%s)", result.Account, result.Edition, model, result.Status, result.Detail)
 		}
 	}
-	writeStatusSnapshot()
+	requestStatusSnapshotRefresh()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
