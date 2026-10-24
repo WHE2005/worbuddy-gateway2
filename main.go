@@ -2419,7 +2419,9 @@ func backgroundQuotaRefresher() {
 		ctx, nextCancel := context.WithCancel(context.Background())
 		cancel = nextCancel
 		done = make(chan struct{})
-		go refreshAllAccountQuotas(ctx, done, next)
+		// 快照本轮的 ctx/done/next：下一轮 start() 会重新赋值这些变量，闭包不能捕获变量本身
+		scanCtx, scanDone, scanAt := ctx, done, next
+		safeGo("quota_scan", func() { refreshAllAccountQuotas(scanCtx, scanDone, scanAt) })
 	}
 	start()
 	for {
@@ -3405,27 +3407,28 @@ func runServe() {
 		}
 	}
 
-	// 启动后台自动刷新协程
-	go backgroundTokenRefresher()
+	// 启动后台自动刷新协程（safeGoLoop：单循环 panic 退避重启，不再击穿整个进程）
+	safeGoLoop("token_refresher", backgroundTokenRefresher)
 	// 主动续期（保活）：到点刷新全部账号登录凭据，不等访问令牌临近过期
-	go keepaliveLoop()
-	go backgroundQuotaRefresher()
-	go backgroundDailyCheckin()
+	safeGoLoop("keepalive", keepaliveLoop)
+	safeGoLoop("quota_refresher", backgroundQuotaRefresher)
+	safeGoLoop("daily_checkin", backgroundDailyCheckin)
 	if cfg.ModelsRefresh > 0 {
-		go modelsRefreshLoop(time.Duration(cfg.ModelsRefresh) * time.Minute)
+		safeGoLoop("model_catalog_refresh", func() { modelsRefreshLoop(time.Duration(cfg.ModelsRefresh) * time.Minute) })
 	} else {
 		logScheduledTask("model_catalog", "disabled", "disabled", newTraceID(), time.Time{}, time.Time{}, "模型目录自动刷新已关闭")
 	}
 	// 价格探测独立于目录刷新：即使关闭目录刷新，也仍可基于缓存探测价格。
-	go modelPriceProbeLoop()
+	safeGoLoop("price_probe", modelPriceProbeLoop)
 
 	// 启动状态快照协程（monitor 命令实时读取展示）
-	go statusSnapshotLoop()
+	safeGoLoop("status_snapshot", statusSnapshotLoop)
 	statsCtx, stopStats := context.WithCancel(context.Background())
 	statsDone := make(chan struct{})
 	go func() {
 		defer close(statsDone)
-		statsPersistenceLoop(statsCtx)
+		// 不用 safeGoLoop：shutdown 时本循环正常返回，若 panic 重启会违背关闭语义
+		runUntilPanic("stats_persistence", func() { statsPersistenceLoop(statsCtx) })
 	}()
 	defer func() {
 		stopStats()
@@ -3434,7 +3437,7 @@ func runServe() {
 
 	// 启动凭据热加载协程（新增/更新/删除凭据文件免重启生效）
 	if cfg.ReloadInterval > 0 {
-		go accountReloaderLoop()
+		safeGoLoop("credential_reload", accountReloaderLoop)
 	} else {
 		logScheduledTask("credential_reload", "disabled", "disabled", newTraceID(), time.Time{}, time.Time{}, "凭据自动扫描已关闭")
 	}
@@ -3524,7 +3527,7 @@ func runServe() {
 
 	fmt.Println("================================================================")
 	fmt.Println("等待客户端请求中 (按 Ctrl+C 安全停止)...")
-	go runtimeConfigLoop(configCtx)
+	safeGoLoop("runtime_config", func() { runtimeConfigLoop(configCtx) })
 
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)

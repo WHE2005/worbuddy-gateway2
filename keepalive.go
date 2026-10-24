@@ -187,7 +187,7 @@ func keepaliveLoop() {
 	log.Printf("[续期保活] 阶段=启动 结果=已启用 续期时刻=%s 说明=到点主动刷新全部账号登录凭据，只调刷新接口，不请求模型、不消耗额度",
 		formatKeepaliveHours(cfg.KeepaliveHours))
 
-	go func() {
+	safeGo("keepalive_catchup", func() {
 		next := time.Now().Add(keepaliveCatchUpDelay)
 		logScheduledTask("keepalive_catchup", "scheduled", "", newTraceID(), time.Time{}, next, "启动后90秒，只检查久未续期账号")
 		time.Sleep(keepaliveCatchUpDelay)
@@ -210,7 +210,7 @@ func keepaliveLoop() {
 		}
 		log.Printf("[续期保活] 阶段=启动补跑 待续期账号=%d 原因=距上次成功续期超过 %v 或从未续期 说明=服务已稳定，开始补做一轮", overdue, keepaliveOverdueAfter)
 		runKeepaliveOnce("启动补跑", true)
-	}()
+	})
 
 	for {
 		next := nextKeepaliveTime(time.Now(), cfg.KeepaliveHours)
