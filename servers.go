@@ -23,7 +23,20 @@ func newAPIHandler() http.Handler {
 	mux.HandleFunc("/ping", handleHealth)
 	mux.HandleFunc("/admin/probe", handleAdminProbe)
 	mux.HandleFunc("/", handleIndex)
-	return requestAuditMiddleware(corsMiddleware(authMiddleware(mux)))
+	return requestAuditMiddleware(corsMiddleware(authMiddleware(requestBodyLimitMiddleware(mux))))
+}
+
+// requestBodyLimitMiddleware 为模型 API 的请求体设硬上限：四个协议入口都是 io.ReadAll
+// 全量进内存，无上限时失控客户端（或浏览器网页发起的免预检跨域 POST）可以把网关内存打爆。
+// 超限后读 body 报错，各入口统一按「读取请求体失败」400 返回。
+func requestBodyLimitMiddleware(next http.Handler) http.Handler {
+	const maxModelRequestBytes = 64 << 20
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxModelRequestBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func prepareGatewayServers() ([]*http.Server, []net.Listener, error) {

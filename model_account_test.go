@@ -285,6 +285,16 @@ func TestModelAccountPolicyRejectsBeforeUpstream(t *testing.T) {
 
 func TestAdminProbeSkipsAccountDisallowedForModel(t *testing.T) {
 	chdirTemp(t)
+	// 新契约：探测要求已启用 API 鉴权（未鉴权时回环来源不可信）
+	gatewayConfigMu.Lock()
+	oldAPIKey := cfg.APIKey
+	cfg.APIKey = "probe-policy-test-key"
+	gatewayConfigMu.Unlock()
+	t.Cleanup(func() {
+		gatewayConfigMu.Lock()
+		cfg.APIKey = oldAPIKey
+		gatewayConfigMu.Unlock()
+	})
 	t.Cleanup(func() { _ = setModelAccountFilter(nil) })
 	if err := setModelAccountFilter(map[string]modelAccountFileConfig{"m": {Blocklist: []string{"blocked.json"}}}); err != nil {
 		t.Fatal(err)

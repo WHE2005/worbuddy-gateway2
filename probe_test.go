@@ -141,6 +141,16 @@ func TestHandleAdminProbeRejectsNonLoopback(t *testing.T) {
 }
 
 func TestHandleAdminProbeReturnsResults(t *testing.T) {
+	// 新契约：探测要求已启用 API 鉴权（未鉴权时回环来源不可信）
+	gatewayConfigMu.Lock()
+	oldAPIKey := cfg.APIKey
+	cfg.APIKey = "probe-test-key"
+	gatewayConfigMu.Unlock()
+	t.Cleanup(func() {
+		gatewayConfigMu.Lock()
+		cfg.APIKey = oldAPIKey
+		gatewayConfigMu.Unlock()
+	})
 	acc := probeAccount()
 	withProbeAccount(t, acc, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

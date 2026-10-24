@@ -27,7 +27,8 @@ import (
 //   独立进程写入的状态文件会被运行中的服务覆盖。因此 probe 子命令只作为客户端，
 //   真正执行探测并更新账本的是运行中的服务端 /admin/probe 接口。
 //
-// 安全：/admin/probe 只接受回环地址来源；服务设置了 -api-key 时仍需携带该密钥。
+// 安全：/admin/probe 只接受回环地址来源，且要求已启用 API 鉴权——回环来源可能是
+// 浏览器网页发起的免预检跨域请求，不能视为可信；探测会真实调用上游消耗积分。
 // -----------------------------------------------------------------------------
 
 const probePrompt = "Please write a factual paragraph of about 150 words about the water cycle, without markdown."
@@ -71,6 +72,13 @@ func handleAdminProbe(w http.ResponseWriter, r *http.Request) {
 	if !isLoopbackRequest(r) {
 		log.Printf("[Probe] 拒绝非回环来源的探测请求: %s", r.RemoteAddr)
 		writeOpenAIError(w, http.StatusForbidden, "probe_local_only", "探测接口仅允许本机回环地址调用")
+		return
+	}
+	if currentAPIKey() == "" {
+		// 回环来源不等于可信来源：浏览器里任意网页都会以回环身份发起免预检跨域 POST。
+		// 探测会真实调用上游并消耗积分，必须先启用 API 鉴权才允许触发。
+		log.Printf("[Probe] 拒绝探测请求 原因=未启用API鉴权 说明=请先在 config.json 设置 gateway.apiKeyEnabled=true 与 gateway.apiKey")
+		writeOpenAIError(w, http.StatusForbidden, "probe_requires_api_key", "探测接口要求先启用 API 鉴权（gateway.apiKeyEnabled + apiKey）；未鉴权时本机来源同样不可信")
 		return
 	}
 

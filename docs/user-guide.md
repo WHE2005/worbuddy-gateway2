@@ -411,7 +411,7 @@ workbuddy-gateway serve -models-refresh 0
 | POST | `/v1/messages/count_tokens` | Anthropic 令牌计数（本地估算，CJK 1 token/字、ASCII 4 字符/token） |
 | GET | `/v1/models`、`/models` | 模型列表，响应头 `X-Model-Source` 标注来源 |
 | GET | `/health`、`/ping` | 健康检查，返回 `version`、`model_count`、`model_source` |
-| POST | `/admin/probe` | 供 `probe` 命令调用，**仅接受回环来源** |
+| POST | `/admin/probe` | 供 `probe` 命令调用，**仅接受回环来源，且必须已启用 API 鉴权** |
 | GET | `/ui/` | 网页控制台静态页面（独立端口，仅 `-webui` 启用时存在） |
 | GET | `/admin/api/*` | 网页控制台数据接口（独立端口，仅 `-webui` 启用时存在，需管理 Key） |
 | GET | `/` | 简单文本说明 |
@@ -778,7 +778,7 @@ workbuddy4.json        intl   hy3      paid     0.42    820     usage.credit=0.4
 | `skipped` | 账号失效或无凭据 |
 | `error` | 网络 / 协议错误 |
 
-> 原理：`probe` 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存中，独立进程直接写状态文件会被服务快照覆盖，因此探测必须由运行中的服务执行。该接口仅接受回环来源；模型 API 启用 Key 校验时同样需要携带 `gateway.apiKey`。
+> 原理：`probe` 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存中，独立进程直接写状态文件会被服务快照覆盖，因此探测必须由运行中的服务执行。该接口仅接受回环来源，且**要求已启用 API 鉴权**（`gateway.apiKeyEnabled=true` + `gateway.apiKey`，probe 命令会自动携带）；未启用鉴权时即使来自本机也会被拒绝，因为浏览器里任意网页都能以回环身份发起免预检的跨域请求。
 
 ---
 
@@ -1165,7 +1165,7 @@ ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -addr 0.0.0.0
 - `workbuddy*.json` 包含真实访问凭据（Access Token / Refresh Token），**严禁提交到 Git 或公开分享**；本仓库 `.gitignore` 已排除。
 - 网关默认只监听 `127.0.0.1`。需要局域网 / 公网访问时改用 `-addr 0.0.0.0`，并在 `config.json` 中开启模型 API Key 校验（`gateway.apiKeyEnabled`），或置于反向代理之后。
 - `config.json` 中的 `gateway.adminKey` 与 `gateway.apiKey` 按要求明文保存，请限制该文件权限；网页配置预览隐藏 Key，管理员明确确认编辑警告后才在编辑器显示真实 Key。不要分享编辑器截图或在公共设备上编辑，完整配置只保留在当前页面内存中，不进入审计日志。
-- `/admin/probe` 仅接受回环来源调用。
+- `/admin/probe` 仅接受回环来源调用，且必须已启用 API 鉴权（未启用时本机来源也会被拒绝）。
 - 不再需要某账号授权时，删除对应凭据文件并在 CodeBuddy 控制台撤销授权。
 
 ---

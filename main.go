@@ -3665,22 +3665,22 @@ func requestAuditMiddleware(next http.Handler) http.Handler {
 // 中间件: CORS 与可选 APIKey 校验
 // -----------------------------------------------------------------------------
 
+// corsMiddleware 不再下发 Access-Control-Allow-Origin: *：本网关的客户端是 CLI/SDK，
+// 不依赖浏览器 CORS；放开通配等于让任意网页获得跨域读取本机网关响应的能力。
+// 预检请求仍直接短路与业务隔离；将来如需从浏览器应用跨域调用，再按来源白名单显式开放。
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "*")
 		if r.Method == http.MethodOptions {
 			debugEvent(r, "info", "cors_preflight_completed", map[string]any{
-				"result":  "allowed",
-				"message": "CORS 预检已直接返回，请求未进入业务逻辑",
+				"result":  "short_circuited",
+				"message": "预检请求未进入业务逻辑；网关不下发通配 CORS 头",
 			})
-			log.Printf("[中间件-CORS] traceId=%s 结果=通过并直接响应 说明=预检请求未进入业务方法", w.Header().Get("X-Trace-ID"))
+			log.Printf("[中间件-CORS] traceId=%s 结果=短路 说明=预检请求未进入业务方法，未下发通配CORS头", w.Header().Get("X-Trace-ID"))
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		debugEvent(r, "debug", "cors_check_passed", map[string]any{"result": "allowed"})
-		log.Printf("[中间件-CORS] traceId=%s 结果=通过", w.Header().Get("X-Trace-ID"))
+		debugEvent(r, "debug", "cors_check_passed", map[string]any{"result": "no_wildcard_cors"})
+		log.Printf("[中间件-CORS] traceId=%s 结果=通过 说明=本机网关不下发通配CORS头", w.Header().Get("X-Trace-ID"))
 		next.ServeHTTP(w, r)
 	})
 }
