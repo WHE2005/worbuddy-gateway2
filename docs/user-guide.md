@@ -119,7 +119,8 @@ workbuddy-gateway serve -webui -allow-price-probes
     "webPort": 8316,
     "adminKey": "",
     "apiKeyEnabled": false,
-    "apiKey": ""
+    "apiKey": "",
+    "keys": []
   }
 }
 ```
@@ -129,10 +130,11 @@ workbuddy-gateway serve -webui -allow-price-probes
 | `apiPort` | `8317` | 模型 API 监听端口，省略或 `0` 使用默认值；也可用 `-port` 临时覆盖 |
 | `webPort` | `8316` | 网页控制台监听端口，省略或 `0` 使用默认值；仅在显式 `-webui` 时监听 |
 | `adminKey` | `""` | 网页控制台管理 Key，有两种设置方式：**① 页面一键生成**——为空时在服务器本机（或 SSH 本地端口转发）打开网页，生成 32 字符随机 Key 写入本文件，并在弹窗中**仅展示一次**；**② 手动编辑本文件**——直接把本字段改成任意随机字符串（建议 32 位），保存后约 1 秒热生效。设置完成后可从其他设备用该 Key 登录 |
-| `apiKeyEnabled` | `false` | 模型 API 是否校验 Key。关闭时不带 Key 或任意 Key 均可调用模型；开启时必须匹配 `apiKey` |
-| `apiKey` | `""` | 模型 API Key。开启校验时必须非空；关闭时保留原值，重新开启即可继续使用 |
+| `apiKeyEnabled` | `false` | 模型 API 是否校验 Key。关闭时不带 Key 或任意 Key 均可调用模型；开启时请求必须匹配 `keys` 中任意一把「启用」的 Key |
+| `apiKey` | `""` | 旧版单 Key 字段，仅作回滚兼容保留：读取时自动迁移为 `keys` 中一把名为「默认」的启用 Key；在网页保存过 Key 列表后会被置空 |
+| `keys` | `[]` | 多把模型 API Key：`[{id, name, key, createdAt, enabled, models}]`。`name` 便于辨认；`key` 手填或留空由网页自动生成（`sk-` 前缀 128 位随机熵）；`enabled` 控制单把启停；`models` 填模型名（逗号分隔）限制该 Key 可用范围，留空不限制，被限制的模型对该 Key 表现为不存在（`/v1/models` 也不可见） |
 
-网页控制台也可在「访问设置」页切换 `apiKeyEnabled` 并设置 `apiKey`，保存后立即生效并写回本文件；端口修改需要重启。管理 Key 与模型 API Key **相互独立**：关闭模型 API 鉴权不会关闭管理鉴权，模型 API Key 也不能登录网页控制台。为避免他人抢先生成，**页面一键生成**管理 Key 只允许本机访问；**手动编辑 `config.json` 设置 `gateway.adminKey`** 不受此限制，效果与一键生成完全相同。
+网页控制台「访问设置」页以**列表形式管理 API Key**（新建/编辑/删除/启用开关/显示与复制，留空自动生成），整表保存后立即生效并写回本文件；鉴权开关同页切换；端口修改需要重启。管理 Key 与模型 API Key **相互独立**：关闭模型 API 鉴权不会关闭管理鉴权，模型 API Key 也不能登录网页控制台。`probe` 命令自动携带**第一把启用的 Key**。为避免他人抢先生成，**页面一键生成**管理 Key 只允许本机访问；**手动编辑 `config.json` 设置 `gateway.adminKey`** 不受此限制，效果与一键生成完全相同。
 
 > **升级顺序（重要）**：新版本能读取不含 `gateway` 段的旧配置，但**旧版本二进制遇到含 `gateway` 段的新配置会启动失败**（`json: unknown field "gateway"`）。请**先替换二进制、再添加 `gateway` 配置**。
 
@@ -348,7 +350,7 @@ workbuddy-gateway serve -keepalive-hours ""
 | 配置 | 生效方式 |
 |---|---|
 | 模型名单、`models.accounts`（含 `all`） | 热生效，控制后续调度 |
-| `gateway.adminKey` / `apiKeyEnabled` / `apiKey` | 热生效；管理 Key 改变后需使用新 Key 登录 |
+| `gateway.adminKey` / `apiKeyEnabled` / `keys` | 热生效；管理 Key 改变后需使用新 Key 登录 |
 | `systemPrompt` / `debug.enabled` | 热生效 |
 | `upstream` 超时、网络重试次数 | 后续上游请求使用新值；已有流式响应保持原空闲超时 |
 | `gateway.apiPort` / `webPort` | 写入配置但**重启后**变更监听；页面仍显示实际监听端口 |
@@ -778,7 +780,7 @@ workbuddy4.json        intl   hy3      paid     0.42    820     usage.credit=0.4
 | `skipped` | 账号失效或无凭据 |
 | `error` | 网络 / 协议错误 |
 
-> 原理：`probe` 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存中，独立进程直接写状态文件会被服务快照覆盖，因此探测必须由运行中的服务执行。该接口仅接受回环来源，且**要求已启用 API 鉴权**（`gateway.apiKeyEnabled=true` + `gateway.apiKey`，probe 命令会自动携带）；未启用鉴权时即使来自本机也会被拒绝，因为浏览器里任意网页都能以回环身份发起免预检的跨域请求。
+> 原理：`probe` 作为客户端调用运行中服务的 `/admin/probe`。账本保存在 `serve` 进程内存中，独立进程直接写状态文件会被服务快照覆盖，因此探测必须由运行中的服务执行。该接口仅接受回环来源，且**要求已启用 API 鉴权**（`gateway.apiKeyEnabled=true` 且 `keys` 中至少一把启用；probe 命令自动携带第一把启用的 Key）；未启用鉴权时即使来自本机也会被拒绝，因为浏览器里任意网页都能以回环身份发起免预检的跨域请求。
 
 ---
 
