@@ -26,6 +26,7 @@ Windows 可使用 `.\workbuddy-gateway.exe`。管理端口默认 `8316`，模型
 | 完整使用手册、配置、客户端接入与部署 | [docs/user-guide.md](docs/user-guide.md) |
 | 目录职责与命名约定 | [docs/project-layout.md](docs/project-layout.md) |
 | 贡献者及方案署名 | [docs/contributors.md](docs/contributors.md) |
+| Linux 服务器部署清单（systemd） | [docs/deploy-linux.md](docs/deploy-linux.md) |
 | 测试入口与说明 | [tests/README.md](tests/README.md) |
 
 ## 构建与测试

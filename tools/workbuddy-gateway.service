@@ -1,0 +1,26 @@
+[Unit]
+Description=WorkBuddy Local Gateway (account pool -> OpenAI/Anthropic compatible API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 部署时创建专用低权用户： useradd -r -s /usr/sbin/nologin workbuddy
+User=workbuddy
+Group=workbuddy
+WorkingDirectory=/opt/workbuddy-gateway
+ExecStart=/opt/workbuddy-gateway/workbuddy-gateway serve -webui
+# 等价 NSSM 的 AppExit=Restart / AppRestartDelay=5000 / AppThrottle=1500
+Restart=on-failure
+RestartSec=5
+# 网关自身按天写 logs/ 并按 config.json 的 logs.retentionDays 清理；
+# stdout/stderr 进 journald（journalctl -u workbuddy-gateway -f）。
+# 基础加固：只写自己的目录，禁新增特权，独立 /tmp
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/workbuddy-gateway
+
+[Install]
+WantedBy=multi-user.target
