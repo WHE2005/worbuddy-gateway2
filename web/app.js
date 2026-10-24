@@ -18,6 +18,8 @@
     timer: null,
     refreshPending: false,
     settings: null,
+    apiKeys: [],
+    keyReveal: {},
     togglePending: false,
     policyVersion: 0,
     logSettings: null,
@@ -163,6 +165,10 @@
     $("poolHealthBar").style.width = "0%";
     $("poolHealthStatus").textContent = "等待账号状态";
     if ($("poolStateDist")) $("poolStateDist").innerHTML = "";
+    state.apiKeys = [];
+    state.keyReveal = {};
+    if ($("keysBody")) $("keysBody").innerHTML = "";
+    if ($("keysBadge")) { $("keysBadge").textContent = "鉴权未启用"; $("keysBadge").className = "badge"; }
     $("accountAlertsInfo").textContent = "登录后读取账号异常日志。";
     $("accountAlerts").innerHTML = '<p class="stats-empty">等待日志</p>';
     ["meta", "gatewayInfo", "logBox", "configBox", "tasksInfo"].forEach(function (id) {
@@ -1866,8 +1872,7 @@
   function renderSettings(data) {
     state.settings = data;
     $("apiKeyEnabled").checked = data.apiKeyEnabled;
-    $("modelAPIKey").value = "";
-    $("apiKeyState").textContent = data.apiKeyConfigured ? "已配置 API Key，留空将保留原值。" : "尚未配置 API Key。";
+    renderKeysBadge();
     $("apiPortValue").textContent = data.apiPort;
     $("webPortValue").textContent = data.webPort;
     $("configuredApiPort").value = data.configuredApiPort || data.apiPort;
@@ -1884,27 +1889,28 @@
       if (version === state.settingsLoadVersion) renderSettings(data);
     }).catch(function () {}).then(function () {
       if (version === state.settingsLoadVersion) setSettingsBusy(false);
+    }).then(function () {
+      if (version === state.settingsLoadVersion) loadAPIKeys();
     });
   }
 
   function setSettingsBusy(busy) {
-    ["apiKeyEnabled", "modelAPIKey", "configuredApiPort", "configuredWebPort", "saveAPISettings", "savePortSettings"]
+    ["apiKeyEnabled", "configuredApiPort", "configuredWebPort", "saveAPISettings", "savePortSettings", "saveAPIKeys", "addAPIKey"]
       .forEach(function (id) { $(id).disabled = busy; });
   }
 
   function saveAPISettings() {
     var enabled = $("apiKeyEnabled").checked;
-    var key = $("modelAPIKey").value;
-    if (enabled && !key && !(state.settings && state.settings.apiKeyConfigured)) {
-      showAlert("开启 API Key 校验前必须输入一个 Key。");
+    if (enabled && !(state.apiKeys || []).some(function (k) { return k.enabled; })) {
+      showAlert("开启鉴权前需要至少一把「启用」状态的 API Key；请先在下方新建并保存。");
       reportUIEvent("settings_validation_failed", "/admin/api/settings", 0, traceID());
-      return;
+      return Promise.resolve();
     }
     setSettingsBusy(true);
-    return api("/admin/api/settings", {method: "POST", body: {apiKeyEnabled: enabled, apiKey: key}})
+    return api("/admin/api/settings", {method: "POST", body: {apiKeyEnabled: enabled}})
       .then(function (data) {
         renderSettings(data);
-        showAlert("已写入 config.json，API 鉴权设置立即生效；管理鉴权未改变。", true);
+        showAlert("已写入 config.json，鉴权开关立即生效；管理鉴权未改变。", true);
       }).catch(function () {}).then(function () { setSettingsBusy(false); });
   }
 
@@ -1923,6 +1929,123 @@
         renderSettings(data);
         showAlert("端口已写入 config.json，重启网关后生效；当前监听端口未改变。", true);
       }).catch(function () {}).then(function () { setSettingsBusy(false); });
+  }
+
+  // ---- API Key 列表管理：整表编辑、一次性保存；Key 明文仅存于当前页面内存 ----
+  function applyKeysView(data) {
+    state.apiKeys = (data.keys || []).map(function (k) {
+      return {id: k.id, name: k.name, key: k.key, createdAt: k.createdAt, enabled: !!k.enabled, models: (k.models || []).join(", ")};
+    });
+    state.keyReveal = {};
+    renderAPIKeys();
+    renderKeysBadge();
+  }
+
+  function loadAPIKeys() {
+    if (!state.apiKey) return Promise.resolve();
+    return api("/admin/api/keys").then(function (data) {
+      applyKeysView(data);
+    }).catch(function () {
+      showAlert("API Key 列表读取失败，保留上次内容。");
+    });
+  }
+
+  function renderKeysBadge() {
+    var el = $("keysBadge");
+    if (!el) return;
+    var enabled = state.settings && state.settings.apiKeyEnabled;
+    var count = (state.apiKeys || []).filter(function (k) { return k.enabled; }).length;
+    el.textContent = enabled ? "已启用鉴权 · " + count + " 把 Key 生效" : "鉴权未启用 · " + count + " 把 Key 已保存";
+    el.className = "badge " + (enabled ? "ok" : "");
+  }
+
+  function renderAPIKeys() {
+    var body = $("keysBody");
+    if (!body) return;
+    body.innerHTML = (state.apiKeys || []).map(function (k) {
+      var revealed = !!state.keyReveal[k.id];
+      return '<tr data-key-id="' + esc(k.id) + '">' +
+        '<td><input class="key-input" data-field="name" value="' + esc(k.name) + '" autocomplete="off" spellcheck="false" aria-label="Key 名称"></td>' +
+        '<td class="key-cell"><input class="key-input" data-field="key" type="' + (revealed ? "text" : "password") + '" value="' + esc(k.key) + '" placeholder="留空自动生成" autocomplete="off" spellcheck="false" aria-label="Key 值">' +
+        '<button type="button" class="ghost key-act" data-act="reveal">' + (revealed ? "隐藏" : "显示") + "</button>" +
+        '<button type="button" class="ghost key-act" data-act="copy">复制</button></td>' +
+        '<td class="mono">' + esc(fmtTime(k.createdAt)) + "</td>" +
+        '<td><input type="checkbox" data-field="enabled"' + (k.enabled ? " checked" : "") + ' aria-label="启用"></td>' +
+        '<td><input class="key-input" data-field="models" value="' + esc(k.models) + '" placeholder="留空 = 不限制" autocomplete="off" spellcheck="false" aria-label="可用模型"></td>' +
+        '<td><button type="button" class="danger key-act" data-act="delete">删除</button></td>' +
+        "</tr>";
+    }).join("") || '<tr><td colspan="6" class="empty">还没有 API Key；点「新建 Key」创建第一把。</td></tr>';
+  }
+
+  function apikeyById(id) {
+    return (state.apiKeys || []).filter(function (k) { return k.id === id; })[0] || null;
+  }
+
+  function addAPIKey() {
+    state.apiKeys.push({id: "k" + Date.now().toString(36) + Math.floor(Math.random() * 1296).toString(36),
+      name: "", key: "", createdAt: Math.floor(Date.now() / 1000), enabled: true, models: ""});
+    renderAPIKeys();
+    renderKeysBadge();
+  }
+
+  // 留空自动生成：sk- 前缀 + 128 位随机熵（优先 crypto.getRandomValues）。
+  function generateAPIKey() {
+    var hex = "0123456789abcdef", out = "";
+    var bytes = new Array(16);
+    if (window.crypto && window.crypto.getRandomValues) {
+      var raw = new Uint8Array(16);
+      window.crypto.getRandomValues(raw);
+      for (var i = 0; i < 16; i++) bytes[i] = raw[i];
+    } else {
+      for (var j = 0; j < 16; j++) bytes[j] = Math.floor(Math.random() * 256);
+    }
+    for (var n = 0; n < bytes.length; n++) { out += hex[bytes[n] >> 4]; out += hex[bytes[n] & 15]; }
+    return "sk-" + out;
+  }
+
+  function copyKeyValue(id) {
+    var entry = apikeyById(id);
+    if (!entry || !entry.key) { showAlert("这把 Key 还没有值，先填写或保存后自动生成。"); return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(entry.key).then(function () {
+        showAlert("Key 已复制到剪贴板。", true);
+      }, function () { showAlert("复制失败：请显示后手动复制。"); });
+    } else {
+      showAlert("当前浏览器不支持剪贴板 API，请显示后手动复制。");
+    }
+  }
+
+  function saveAPIKeys() {
+    var seen = {};
+    var outgoing = [];
+    for (var i = 0; i < (state.apiKeys || []).length; i++) {
+      var k = state.apiKeys[i];
+      var name = String(k.name || "").trim() || "未命名 Key";
+      var key = String(k.key || "").trim();
+      if (!key) key = generateAPIKey();
+      if (key.length > 128) {
+        showAlert("Key 最长 128 个字符：" + name);
+        reportUIEvent("settings_validation_failed", "/admin/api/keys", 0, traceID());
+        return Promise.resolve();
+      }
+      if (seen[key]) {
+        showAlert("存在重复的 Key 值：" + name + "；每把 Key 必须唯一。");
+        reportUIEvent("settings_validation_failed", "/admin/api/keys", 0, traceID());
+        return Promise.resolve();
+      }
+      seen[key] = true;
+      var models = String(k.models || "").split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean);
+      outgoing.push({id: k.id, name: name, key: key, createdAt: k.createdAt, enabled: !!k.enabled, models: models});
+    }
+    setSettingsBusy(true);
+    return api("/admin/api/keys", {method: "POST", body: {keys: outgoing}}).then(function (data) {
+      applyKeysView(data);
+      showAlert("API Key 列表已保存并立即生效；被删除或停用的 Key 将立即失去授权。", true);
+      reportUIEvent("request_completed", "/admin/api/keys", 200, traceID());
+    }).catch(function (err) {
+      reportUIEvent("request_failed", "/admin/api/keys", err && err.status || 0, traceID());
+      showAlert("API Key 列表保存失败" + (err && err.message ? "：" + err.message : "。"));
+    }).then(function () { setSettingsBusy(false); });
   }
 
   // 管理 Key 仅保存在当前标签页会话，验证成功后才保存。
@@ -2046,6 +2169,46 @@
     });
     $("initializeAdmin").addEventListener("click", initializeAdmin);
     $("saveAPISettings").addEventListener("click", saveAPISettings);
+    $("addAPIKey").addEventListener("click", addAPIKey);
+    $("saveAPIKeys").addEventListener("click", saveAPIKeys);
+    $("keysBody").addEventListener("input", function (event) {
+      var input = event.target.closest("input[data-field]");
+      if (!input) return;
+      var row = input.closest("tr[data-key-id]");
+      if (!row) return;
+      var entry = apikeyById(row.getAttribute("data-key-id"));
+      if (!entry) return;
+      var field = input.getAttribute("data-field");
+      if (field === "enabled") { entry.enabled = input.checked; renderKeysBadge(); }
+      else entry[field] = input.value;
+    });
+    $("keysBody").addEventListener("change", function (event) {
+      if (event.target.matches('input[data-field="enabled"]')) {
+        var row = event.target.closest("tr[data-key-id]");
+        var entry = row && apikeyById(row.getAttribute("data-key-id"));
+        if (entry) { entry.enabled = event.target.checked; renderKeysBadge(); }
+      }
+    });
+    $("keysBody").addEventListener("click", function (event) {
+      var button = event.target.closest("button[data-act]");
+      if (!button) return;
+      var row = button.closest("tr[data-key-id]");
+      if (!row) return;
+      var id = row.getAttribute("data-key-id");
+      var act = button.getAttribute("data-act");
+      if (act === "delete") {
+        if (!window.confirm("删除这把 Key？点「保存 API Key 列表」后生效；使用它的客户端将立即失去授权。")) return;
+        state.apiKeys = state.apiKeys.filter(function (k) { return k.id !== id; });
+        delete state.keyReveal[id];
+        renderAPIKeys();
+        renderKeysBadge();
+      } else if (act === "reveal") {
+        state.keyReveal[id] = !state.keyReveal[id];
+        renderAPIKeys();
+      } else if (act === "copy") {
+        copyKeyValue(id);
+      }
+    });
     $("savePortSettings").addEventListener("click", savePortSettings);
     $("editConfig").addEventListener("click", showConfigWarning);
     $("acknowledgeConfigEdit").addEventListener("click", loadConfigEditor);

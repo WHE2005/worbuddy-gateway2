@@ -287,13 +287,22 @@
       <div class="settings-row">
         <label for="apiKeyEnabled"><input id="apiKeyEnabled" type="checkbox"> 开启模型 API Key 校验</label>
       </div>
-      <div class="settings-row">
-        <label for="modelAPIKey">模型 API Key</label>
-        <input id="modelAPIKey" type="password" autocomplete="new-password" placeholder="开启校验时必须设置；已有 Key 可留空保留">
-        <span id="apiKeyState" class="hint"></span>
+      <div class="keys-head">
+        <span id="keysBadge" class="badge">鉴权未启用</span>
+        <button id="addAPIKey" type="button">+ 新建 Key</button>
       </div>
-      <p class="hint">关闭时，客户端不带 Key 或使用任意 Key 均可调用模型。开启时必须匹配已保存的 API Key；保存后立即生效，已有流式请求不被主动中断。</p>
-      <button id="saveAPISettings" type="button">保存 API 访问设置</button>
+      <div class="table-wrap">
+        <table id="keysTable">
+          <thead><tr><th>名称</th><th>Key</th><th>创建时间</th><th>启用</th><th>可用模型（逗号分隔，留空=不限制）</th><th>操作</th></tr></thead>
+          <tbody id="keysBody"></tbody>
+        </table>
+      </div>
+      <p class="hint">客户端请求需带 Authorization: Bearer &lt;key&gt; 或 x-api-key: &lt;key&gt;；保存后立即生效，已有流式请求不被主动中断。新建时 Key 留空将自动生成 <span class="mono">sk-</span> 前缀随机密钥；可用范围填写模型名（逗号分隔），被限制的模型对该 Key 表现为不存在（/v1/models 也不可见），提供它的账号不在可用列表时请求同样被拒。</p>
+      <div class="actions">
+        <button id="saveAPIKeys" type="button">保存 API Key 列表</button>
+        <button id="saveAPISettings" type="button">保存鉴权开关</button>
+      </div>
+      <p id="keysStatus" class="hint action-result" role="status"></p>
       <div class="settings-ports">
         <div>API 监听端口：<strong id="apiPortValue">-</strong></div>
         <div>Web 监听端口：<strong id="webPortValue">-</strong></div>

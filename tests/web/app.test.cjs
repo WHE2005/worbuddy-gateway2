@@ -68,6 +68,7 @@ function fixture(fetchImpl = async () => response(200, {}), cookies = new Map())
     , renderStats, loadStats, changeStatsFilter, statsLineChart, statsComboChart, statsDuration, statsNumber, statsCredit
     , openAddAccount, startAddAccount, pollAddAccount, closeAddAccount, accountRowActions
     , initStatsFilter, writeStatsFilterCookie, readStatsFilterCookie
+    , loadAPIKeys, renderAPIKeys, renderKeysBadge, addAPIKey, saveAPIKeys, generateAPIKey, applyKeysView
   };})();`);
   vm.createContext(context);
   vm.runInContext(source, context);
@@ -279,7 +280,7 @@ test("首次初始化只弹窗一次，并使用返回的管理Key登录", async
   audit("初始化弹窗与登录通过", {key_length: key.length, saved_to_localStorage: false});
 });
 
-test("没有API Key时阻止开启；关闭开关可以保存", async () => {
+test("没有启用的Key时阻止开启鉴权；关闭开关可以保存", async () => {
   const calls = [];
   const f = fixture(async (route, options) => {
     calls.push({route, options});
@@ -288,16 +289,57 @@ test("没有API Key时阻止开启；关闭开关可以保存", async () => {
   });
   f.review.state.apiKey = "synthetic-admin-key";
   f.review.state.settings = {apiKeyConfigured: false};
+  f.review.state.apiKeys = [];
   f.element("apiKeyEnabled").checked = true;
   f.review.saveAPISettings();
   assert.equal(calls.filter(c => c.route === "/admin/api/settings").length, 0);
-  assert.match(f.element("alert").textContent, /必须输入/);
-  f.element("apiKeyEnabled").checked = false;
+  assert.match(f.element("alert").textContent, /至少一把/);
+  f.review.state.apiKeys = [{id: "k1", name: "Zcode", key: "sk-abc", createdAt: 1760000000, enabled: true, models: ""}];
+  f.element("apiKeyEnabled").checked = true;
   f.review.saveAPISettings();
   await new Promise(resolve => setImmediate(resolve));
   const saved = calls.find(c => c.route === "/admin/api/settings");
-  assert.equal(JSON.parse(saved.options.body).apiKeyEnabled, false);
+  assert.equal(JSON.parse(saved.options.body).apiKeyEnabled, true);
   audit("API鉴权开关表单通过");
+});
+
+test("API Key 列表：整表加载、留空自动生成、保存立即生效", async () => {
+  const calls = [];
+  const f = fixture(async (route, options) => {
+    calls.push({route, options});
+    if (route === "/admin/api/keys" && (!options.method || options.method === "GET")) {
+      return response(200, {apiKeyEnabled: true, enabledCount: 1, keys: [
+        {id: "a1", name: "Zcode", key: "sk-aaa111", createdAt: 1760000000, enabled: true, models: []}]});
+    }
+    if (route === "/admin/api/keys" && options.method === "POST") {
+      const saved = JSON.parse(options.body);
+      return response(200, {apiKeyEnabled: true, enabledCount: 2, keys: saved.keys});
+    }
+    return response(204, {});
+  });
+  f.review.state.apiKey = "synthetic-admin-key";
+  f.review.state.settings = {apiKeyEnabled: true};
+  await f.review.loadAPIKeys();
+  assert.equal(f.review.state.apiKeys.length, 1);
+  assert.match(f.element("keysBody").innerHTML, /Zcode/);
+  assert.match(f.element("keysBadge").textContent, /1 把 Key 生效/);
+  f.review.addAPIKey();
+  assert.equal(f.review.state.apiKeys.length, 2);
+  assert.equal(f.review.state.apiKeys[1].key, "");
+  const generated = f.review.generateAPIKey();
+  assert.match(generated, /^sk-[0-9a-f]{32}$/);
+  f.review.state.apiKeys[1].name = "CLI";
+  f.review.state.apiKeys[1].key = "";
+  f.review.state.apiKeys[1].models = "gpt-5.6-luna, hy3";
+  await f.review.saveAPIKeys();
+  const saved = calls.find(c => c.route === "/admin/api/keys" && c.options.method === "POST");
+  assert(saved, "必须发出保存请求");
+  const body = JSON.parse(saved.options.body);
+  assert.equal(body.keys.length, 2);
+  assert.match(body.keys[1].key, /^sk-[0-9a-f]{32}$/, "留空的 Key 必须自动生成");
+  assert.deepEqual(body.keys[1].models, ["gpt-5.6-luna", "hy3"]);
+  assert.equal(f.review.state.apiKeys.length, 2, "保存后应以服务端返回回填");
+  audit("API Key 列表管理通过", {auto_generated: true});
 });
 
 const configContent = JSON.stringify({gateway: {adminKey: "synthetic-admin-key", apiKey: "synthetic-private-api-key"}, systemPrompt: {force: "synthetic-private-prompt"}}, null, 2);

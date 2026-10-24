@@ -316,3 +316,53 @@ func TestWebUIStyleKeepsHiddenRule(t *testing.T) {
 		}
 	}
 }
+
+// API Key 多把管理：整表保存、运行时立即生效、可用范围与停用语义、
+// 重复 Key 拒绝、旧单 Key 配置自动迁移。
+func TestWebUIAPIKeysCRUDScopeAndMigration(t *testing.T) {
+	isolateAdminFeatures(t)
+	handler := newWebUIHandler()
+
+	rec := adminRequest(handler, http.MethodGet, "/admin/api/keys", "feature-admin-key", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("初始列表状态码=%d，期望 200", rec.Code)
+	}
+
+	body := `{"keys":[{"id":"k1","name":"Zcode","key":"sk-test-1","createdAt":1760000000,"enabled":true},` +
+		`{"id":"k2","name":"Scoped","key":"sk-test-2","createdAt":1760000000,"enabled":true,"models":["hy3","gpt-5.6-luna"]},` +
+		`{"id":"k3","name":"停用","key":"sk-test-3","createdAt":1760000000,"enabled":false}]}`
+	rec = adminRequest(handler, http.MethodPost, "/admin/api/keys", "feature-admin-key", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("保存状态码=%d，期望 200：%s", rec.Code, rec.Body.String())
+	}
+
+	entry, ok := matchAPIKey("sk-test-1")
+	if !ok || entry.Name != "Zcode" || len(entry.Models) != 0 {
+		t.Fatalf("第一把 Key 应命中且不受限: ok=%t entry=%+v", ok, entry)
+	}
+	scoped, ok := matchAPIKey("sk-test-2")
+	if !ok || !modelInScope(scoped.Models, "HY3") || modelInScope(scoped.Models, "other") {
+		t.Fatalf("范围 Key 应忽略大小写命中并拒绝范围外模型: ok=%t models=%v", ok, scoped.Models)
+	}
+	if _, ok := matchAPIKey("sk-test-3"); ok {
+		t.Fatalf("停用的 Key 不应命中")
+	}
+	if _, ok := matchAPIKey("sk-wrong"); ok {
+		t.Fatalf("错误 Key 不应命中")
+	}
+	if currentAPIKey() != "sk-test-1" {
+		t.Fatalf("currentAPIKey 应回退到第一把启用的 Key（probe CLI 兼容），got=%q", currentAPIKey())
+	}
+
+	dup := `{"keys":[{"id":"a","name":"A","key":"sk-dup","createdAt":1760000000,"enabled":true},` +
+		`{"id":"b","name":"B","key":"sk-dup","createdAt":1760000000,"enabled":true}]}`
+	rec = adminRequest(handler, http.MethodPost, "/admin/api/keys", "feature-admin-key", dup)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("重复 Key 应 400，got %d", rec.Code)
+	}
+
+	g, err := normalizeGatewayConfig(gatewayFileConfig{APIKeyEnabled: true, APIKey: "legacy-key-123"})
+	if err != nil || len(g.Keys) != 1 || g.Keys[0].Name != "默认" || g.Keys[0].Key != "legacy-key-123" || !g.Keys[0].Enabled {
+		t.Fatalf("旧单 Key 应自动迁移为一把「默认」Key: err=%v keys=%+v", err, g.Keys)
+	}
+}
