@@ -300,3 +300,19 @@ func TestWebUILogsListsLogDir(t *testing.T) {
 		t.Fatalf("日志行数=%d，期望 2", len(resp.Lines))
 	}
 }
+
+// 回归防护：style.css 的 .hidden 是所有「默认隐藏面板」的唯一开关
+// （首次设置、二维码结果区、配置警告、告警条）。重写样式时一旦丢失，
+// 这些面板会全部常驻显示、按钮看起来失灵。必须包含且带 !important。
+func TestWebUIStyleKeepsHiddenRule(t *testing.T) {
+	css, err := webFS.ReadFile("web/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(css)
+	for _, rule := range []string{".hidden", "display: none !important"} {
+		if !strings.Contains(text, rule) {
+			t.Fatalf("style.css 缺少关键规则 %q，隐藏面板会全部常驻显示", rule)
+		}
+	}
+}

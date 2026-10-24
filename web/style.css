@@ -164,6 +164,8 @@ button:active { transform: translateY(0.5px); }
 button.ghost { background: transparent; }
 button.danger { border-color: var(--danger); color: var(--danger); }
 button:disabled { opacity: 0.55; cursor: not-allowed; }
+/* 所有"默认隐藏"面板的唯一开关：setup/二维码/配置警告/告警条都靠这个类隐藏。 */
+.hidden { display: none !important; }
 button:disabled:hover { border-color: var(--border); color: var(--text); }
 
 /* ---------------------------------------------------------------------------
