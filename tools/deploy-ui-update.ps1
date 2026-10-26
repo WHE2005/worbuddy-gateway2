@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$root = '.'
+$root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $log  = Join-Path $root 'tools\deploy-ui-update.log'
 function Log($m) {
   $line = "[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m

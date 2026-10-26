@@ -2,7 +2,8 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Net.Http
 
 $base = 'http://127.0.0.1:8327/v1'
-$apiKey = 'REDACTED'
+$apiKey = $env:WB_API_KEY
+if (-not $apiKey) { throw '请先设置环境变量 WB_API_KEY（与 config.json 中的模型 API Key 一致）' }
 $targets = @('hy3','hy3-x','hy4-preview','hy4-preview-x','glm-5.1','glm-5.2','glm-5.3','glm-5.3-flash','glm-5v-turbo','auto','default')
 
 $handler = New-Object System.Net.Http.HttpClientHandler
@@ -42,5 +43,5 @@ foreach ($m in $targets) {
     Start-Sleep -Seconds 20
 }
 
-$results | ConvertTo-Json -Depth 5 | Set-Content -Path '.\tools\model-probe-new.json' -Encoding UTF8
+$results | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $PSScriptRoot 'model-probe-new.json') -Encoding UTF8
 Write-Host ("DONE ok=" + ($results | Where-Object { $_.http -eq 200 }).Count)

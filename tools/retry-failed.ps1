@@ -2,7 +2,8 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Net.Http
 
 $base = 'http://127.0.0.1:8327/v1'
-$apiKey = 'REDACTED'
+$apiKey = $env:WB_API_KEY
+if (-not $apiKey) { throw '请先设置环境变量 WB_API_KEY（与 config.json 中的模型 API Key 一致）' }
 $failed = @(
   'deepseek-v3.1','deepseek-v3-0324','deepseek-v4-pro-exclusive',
   'gemini-3.5-flash','glm-4.6','glm-4.6v','glm-4.7','glm-5.0','glm-5.0-turbo',
@@ -15,7 +16,7 @@ $client = New-Object System.Net.Http.HttpClient($handler)
 $client.Timeout = [TimeSpan]::FromSeconds(120)
 $client.DefaultRequestHeaders.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue('Bearer', $apiKey)
 
-$outJson = '.\tools\model-probe-failed.json'
+$outJson = (Join-Path $PSScriptRoot 'model-probe-failed.json')
 $results = @()
 
 foreach ($m in $failed) {

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -10,8 +12,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1078,4 +1082,555 @@ func handleWebUICredentials(w http.ResponseWriter, r *http.Request) {
 		// 保留字段名便于前端展示生成时间
 		"generatedAt": time.Now().Unix(),
 	})
+}
+
+// -----------------------------------------------------------------------------
+// 以下内容原位于 websecurity.go（合并整理，逻辑未改动）
+// -----------------------------------------------------------------------------
+
+func newWebUIHandler() http.Handler {
+	if !cfg.WebUI {
+		return http.NotFoundHandler()
+	}
+	mux := http.NewServeMux()
+	registerWebUIRoutes(mux)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/ui/", http.StatusFound)
+	})
+	return requestAuditMiddleware(adminSecurityMiddleware(adminAuthMiddleware(mux)))
+}
+
+func adminSecurityMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		reject := func(reason string) {
+			log.Printf("[管理请求拦截] traceId=%s 层=管理来源校验 原因=%s 状态码=403 业务影响=请求未进入管理业务", debugTraceID(r), reason)
+			writeJSONError(w, http.StatusForbidden, reason)
+		}
+		if origin := r.Header.Get("Origin"); origin != "" {
+			u, err := url.Parse(origin)
+			if err != nil || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") ||
+				!strings.EqualFold(u.Host, r.Host) || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+				reject("管理界面只接受同源请求")
+				return
+			}
+		}
+		if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+			reject("拒绝跨站管理请求")
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			contentType := strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0])
+			if r.Header.Get("X-Workbuddy-Admin") != "1" || !strings.EqualFold(contentType, "application/json") {
+				reject("管理写操作必须由同源 JSON 请求提交")
+				return
+			}
+		}
+		log.Printf("[管理来源校验] traceId=%s 结果=通过 说明=不向其他来源开放管理CORS", debugTraceID(r))
+		next.ServeHTTP(w, r)
+	})
+}
+
+func adminAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/admin/api/") || r.URL.Path == "/admin/api/setup" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		key := currentAdminKey()
+		header := r.Header.Get("Authorization")
+		token := ""
+		if strings.HasPrefix(header, "Bearer ") {
+			token = strings.TrimPrefix(header, "Bearer ")
+		}
+		if key == "" || subtle.ConstantTimeCompare([]byte(token), []byte(key)) != 1 {
+			log.Printf("[管理请求拦截] traceId=%s 层=管理鉴权 状态码=401 业务影响=请求未进入业务方法 管理Key已配置=%t", debugTraceID(r), key != "")
+			writeJSONError(w, http.StatusUnauthorized, "请使用管理 Key 登录，不接受模型 API Key")
+			return
+		}
+		log.Printf("[管理鉴权] traceId=%s 结果=通过 说明=管理Key与模型API鉴权独立", debugTraceID(r))
+		next.ServeHTTP(w, r)
+	})
+}
+
+// 不信任代理声明的客户端 IP；初始化只能在回环连接和回环 Host 上完成。
+func localAdminSetupRequest(r *http.Request) bool {
+	remote, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil || !net.ParseIP(remote).IsLoopback() {
+		return false
+	}
+	u, err := url.Parse("http://" + r.Host)
+	if err != nil || u.User != nil {
+		return false
+	}
+	host := u.Hostname()
+	if !strings.EqualFold(host, "localhost") && !net.ParseIP(host).IsLoopback() {
+		return false
+	}
+	return r.Header.Get("Forwarded") == "" && r.Header.Get("X-Forwarded-For") == "" && r.Header.Get("X-Real-IP") == ""
+}
+
+func decodeAdminJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	return decodeAdminJSONLimit(w, r, dst, 16<<10)
+}
+
+func decodeAdminJSONLimit(w http.ResponseWriter, r *http.Request, dst any, limit int64) error {
+	r.Body = http.MaxBytesReader(w, r.Body, limit) // 仅管理表单，不影响模型请求。
+	defer r.Body.Close()
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	return ensureJSONEOF(dec)
+}
+
+func handleWebUISetup(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"setupRequired": currentAdminKey() == "", "localSetupOnly": true,
+			"canInitialize": localAdminSetupRequest(r),
+		})
+	case http.MethodPost:
+		if !localAdminSetupRequest(r) {
+			log.Printf("[管理初始化] traceId=%s 结果=拒绝 原因=非本机直接访问 状态码=403 业务影响=未生成或写入管理Key", debugTraceID(r))
+			writeJSONError(w, http.StatusForbidden,
+				"首次自动生成管理 Key 仅允许本机访问。可选方式：① 在服务器本机打开本页面；"+
+					"② 使用 SSH 本地端口转发（如 ssh -L 8316:127.0.0.1:8316 用户@服务器）后访问；"+
+					"③ 直接在服务器上编辑 config.json，把 gateway.adminKey 设为随机字符串，保存后约 1 秒生效")
+			return
+		}
+		var empty map[string]json.RawMessage
+		if err := decodeAdminJSON(w, r, &empty); err != nil || empty == nil || len(empty) != 0 {
+			log.Printf("[管理初始化] traceId=%s 结果=拒绝 原因=请求JSON无效 状态码=400", debugTraceID(r))
+			writeJSONError(w, http.StatusBadRequest, "初始化请求必须是空 JSON 对象")
+			return
+		}
+		log.Printf("[管理初始化] traceId=%s 阶段=开始 说明=只生成一次32字符随机管理Key，原文不进入日志", debugTraceID(r))
+		key, err := initializeAdminKey(debugTraceID(r))
+		if err != nil {
+			status := http.StatusInternalServerError
+			message := "管理 Key 保存失败，未完成初始化，请检查服务器日志和配置文件权限"
+			if errors.Is(err, errSetupDone) {
+				status, message = http.StatusConflict, errSetupDone.Error()
+			}
+			log.Printf("[管理初始化] traceId=%s 结果=失败 状态码=%d 原因=%v", debugTraceID(r), status, err)
+			writeJSONError(w, status, message)
+			return
+		}
+		log.Printf("[管理初始化] traceId=%s 结果=成功 Key字符数=32 说明=已落盘，仅本次初始化响应返回Key", debugTraceID(r))
+		// 有意仅此一次返回原文，满足页面弹窗；其他管理接口均不返回秘密值。
+		writeJSON(w, http.StatusCreated, map[string]string{"adminKey": key})
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "仅支持 GET/POST")
+	}
+}
+
+func handleWebUISettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		log.Printf("[管理配置] traceId=%s 阶段=读取 结果=成功 说明=仅返回鉴权开关、Key是否已配置及实际监听端口", debugTraceID(r))
+		writeJSON(w, http.StatusOK, gatewaySettingsView())
+	case http.MethodPost:
+		var input struct {
+			Enabled *bool  `json:"apiKeyEnabled"`
+			Key     string `json:"apiKey"`
+			APIPort *int   `json:"apiPort"`
+			WebPort *int   `json:"webPort"`
+		}
+		if err := decodeAdminJSON(w, r, &input); err != nil || input.Enabled == nil && input.APIPort == nil && input.WebPort == nil && input.Key == "" {
+			log.Printf("[管理配置] traceId=%s 阶段=参数校验 结果=拒绝 状态码=400 原因=必须提供有效API鉴权开关和JSON", debugTraceID(r))
+			writeJSONError(w, http.StatusBadRequest, "至少提供 API 鉴权设置或端口设置，字段类型必须正确")
+			return
+		}
+		log.Printf("[管理配置] traceId=%s 阶段=参数校验 鉴权开关已提供=%t 端口已提供=%t 新Key已提供=%t 说明=Key原文不记录", debugTraceID(r), input.Enabled != nil, input.APIPort != nil || input.WebPort != nil, input.Key != "")
+		if err := saveGatewaySettings(input.Enabled, input.Key, input.APIPort, input.WebPort, debugTraceID(r)); err != nil {
+			log.Printf("[管理配置] traceId=%s 结果=失败 原因=%v 业务影响=当前运行时鉴权状态保留", debugTraceID(r), err)
+			status := http.StatusInternalServerError
+			var validation gatewayValidationError
+			if errors.As(err, &validation) {
+				status = http.StatusBadRequest
+			}
+			if errors.Is(err, errConfigChange) {
+				status = http.StatusConflict
+			}
+			writeJSONError(w, status, safeDebugError(err))
+			return
+		}
+		writeJSON(w, http.StatusOK, gatewaySettingsView())
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "仅支持 GET/POST")
+	}
+}
+
+// 将前端校验/请求结果以有限的结构化字段落盘，不接受正文、Key 或任意日志字符串。
+func handleWebUIClientEvent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "仅支持 POST")
+		return
+	}
+	var input struct {
+		Event   string `json:"event"`
+		Route   string `json:"route"`
+		Status  int    `json:"status"`
+		Enabled *bool  `json:"enabled,omitempty"`
+	}
+	if err := decodeAdminJSON(w, r, &input); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "无效的前端审计事件")
+		return
+	}
+	allowed := map[string]bool{"request_completed": true, "request_failed": true, "settings_validation_failed": true, "credential_validation_failed": true, "log_validation_failed": true,
+		"config_edit_warning": true, "config_edit_acknowledged": true, "config_edit_cancelled": true, "config_validation_failed": true,
+		"list_filter_changed": true, "list_filter_restored": true, "list_filter_cookie_failed": true}
+	routes := map[string]bool{
+		"/admin/api/status": true, "/admin/api/models": true, "/admin/api/logs": true,
+		"/admin/api/config": true, "/admin/api/credentials": true, "/admin/api/settings": true,
+		"/admin/api/account-toggle": true, "/admin/api/model-toggle": true,
+		"/admin/api/credential-edit": true, "/admin/api/log-settings": true, "/admin/api/log-cleanup": true,
+		"/admin/api/tasks":          true,
+		"/admin/api/config-edit":    true,
+		"/admin/api/rate-detail":    true,
+		"/admin/api/stats":          true,
+		"/admin/api/account-alerts": true,
+		"/admin/api/account-add":    true,
+		"/admin/api/account-cancel": true,
+		"/admin/api/account-delete": true,
+		"/admin/api/keys":           true,
+	}
+	if !allowed[input.Event] || !routes[input.Route] || input.Status < 0 || input.Status > 599 {
+		writeJSONError(w, http.StatusBadRequest, "不接受未定义的前端审计事件")
+		return
+	}
+	filterEvent := strings.HasPrefix(input.Event, "list_filter_")
+	if filterEvent && (input.Enabled == nil || input.Route != "/admin/api/status" && input.Route != "/admin/api/models") ||
+		!filterEvent && input.Enabled != nil {
+		log.Printf("[管理前端] traceId=%s 阶段=筛选偏好校验 结果=拒绝 状态码=400 说明=只接受账号或模型列表的布尔筛选状态，不接受任意内容", debugTraceID(r))
+		writeJSONError(w, http.StatusBadRequest, "筛选审计必须提供对应列表的布尔状态")
+		return
+	}
+	if filterEvent {
+		log.Printf("[管理前端筛选] traceId=%s 事件=%s 列表=%s 只显示可用=%t 状态码=%d 说明=仅改变网页显示偏好，不修改配置、调度规则或历史统计，不记录Cookie正文和Key",
+			debugTraceID(r), input.Event, input.Route, *input.Enabled, input.Status)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	log.Printf("[管理前端] traceId=%s 事件=%s 接口=%s 状态码=%d 说明=前端请求或参数校验结果已落盘，不含Key与业务正文",
+		debugTraceID(r), input.Event, input.Route, input.Status)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// 只脱敏输出副本，不能修改用于业务判断的原始状态或磁盘文件。
+func writeAdminData(w http.ResponseWriter, r *http.Request, value any) {
+	raw, err := json.Marshal(value)
+	var copyValue any
+	if err == nil {
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		err = decoder.Decode(&copyValue)
+	}
+	if err != nil {
+		log.Printf("[管理响应] traceId=%s 阶段=编码 结果=失败 原因=%v", debugTraceID(r), err)
+		writeJSONError(w, http.StatusInternalServerError, "管理数据编码失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, redactDebugValue(copyValue))
+}
+
+// -----------------------------------------------------------------------------
+// 以下内容原位于 webpolicy.go（合并整理，逻辑未改动）
+// -----------------------------------------------------------------------------
+
+func currentModelPolicyMode() string {
+	modelFilterMu.RLock()
+	defer modelFilterMu.RUnlock()
+	if len(currentFilter.allowlist) > 0 {
+		return "allowlist"
+	}
+	return "blocklist"
+}
+
+// 全局停用是调度策略，不复用授权失效字段，也不删除凭据或历史统计。
+func annotateAccountPolicies(rows []accountSnapshot) {
+	pool := make([]*Account, len(rows))
+	for i := range rows {
+		pool[i] = &Account{Path: rows[i].Path}
+	}
+	for i := range rows {
+		enabled, reason := modelAccountAllowed("all", pool[i], pool)
+		rows[i].SchedulingEnabled, rows[i].SchedulingReason = &enabled, reason
+	}
+}
+
+func rawObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
+	obj := map[string]json.RawMessage{}
+	if len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return nil, err
+		}
+	}
+	if obj == nil {
+		obj = map[string]json.RawMessage{}
+	}
+	return obj, nil
+}
+
+func sortedNames(names map[string]bool) []string {
+	out := make([]string, 0, len(names))
+	for name := range names {
+		if names[name] {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// 用磁盘中最新配置做合并，而不是页面上可能过期的整份配置；保留无关配置段。
+func savePolicyToggle(kind, target string, enabled bool, trace string) error {
+	runtimeConfigMu.Lock()
+	defer runtimeConfigMu.Unlock()
+	gatewayConfigMu.Lock()
+	doc, gateway, old, err := readGatewayDocumentLocked()
+	if err == nil && (cfg.AdminKey == "" || !adminKeyMatches(gateway.AdminKey, cfg.AdminKey)) {
+		err = errConfigChange
+	}
+	gatewayConfigMu.Unlock()
+	if err != nil {
+		return err
+	}
+	c := runtimeFileConfig{}
+	if len(old) > 0 {
+		c, err = parseRuntimeConfig(old)
+		if err != nil {
+			return err
+		}
+	}
+	models, err := rawObject(doc["models"])
+	if err != nil {
+		return err
+	}
+	// 从旧示例升级时移除未启用的模型名单，不再写入互相矛盾的两种字段。
+	if hasModelNames(c.Models.Allowlist) {
+		delete(models, "blocklist")
+	} else {
+		delete(models, "allowlist")
+		if _, exists := models["blocklist"]; !exists {
+			models["blocklist"] = json.RawMessage("[]")
+		}
+	}
+
+	switch kind {
+	case "account":
+		accountMu.Lock()
+		exists, duplicates := false, 0
+		name := filepath.Base(target)
+		accountNames := map[string]int{}
+		for _, acc := range accounts {
+			accountNames[filepath.Base(acc.Path)]++
+			if acc.Path == target {
+				exists = true
+			}
+			if filepath.Base(acc.Path) == name {
+				duplicates++
+			}
+		}
+		accountMu.Unlock()
+		if !exists || duplicates != 1 {
+			return gatewayValidationError("账号不存在或凭据文件名重复，不能设置全局开关")
+		}
+		// 只修改 all 的原始 JSON，保留模型专属规则的字段和 null/空值。
+		accountRules, parseErr := rawObject(models["accounts"])
+		if parseErr != nil {
+			return parseErr
+		}
+		// 大小写兼容已有 ALL；删除旧拼写，保证只写一个 all。
+		global := modelAccountFileConfig{}
+		for id, rule := range c.Models.Accounts {
+			if normalizeModelName(id) == "all" {
+				global = rule
+				delete(accountRules, id)
+			}
+		}
+		blocks, allows := map[string]bool{}, map[string]bool{}
+		for _, n := range global.Blocklist {
+			blocks[strings.TrimSpace(n)] = true
+		}
+		for _, n := range global.Allowlist {
+			allows[strings.TrimSpace(n)] = true
+		}
+		sourceMode := "blocklist"
+		if len(allows) > 0 {
+			sourceMode = "allowlist"
+			// 将当前账号池中未获白名单放行的账号显式停用，
+			// 不能仅删除白名单，否则会意外放开其他账号。
+			for n := range accountNames {
+				if !allows[n] {
+					blocks[n] = true
+				}
+			}
+		}
+		if len(allows) > 0 || len(global.Blocklist) > 0 {
+			for n, count := range accountNames {
+				if count > 1 {
+					blocks[n] = true // 保留规则启用时对重名凭据的拒绝状态。
+				}
+			}
+		}
+		if enabled {
+			delete(blocks, name)
+		} else {
+			blocks[name] = true
+		}
+		finalBlocks := sortedNames(blocks)
+		log.Printf("[账号开关规则] traceId=%s 阶段=转换全局账号名单 来源=%s 当前账号文件名数=%d 原白名单=%q 原黑名单=%q 目标=%q 启用=%t 最终黑名单=%q 说明=删除all.allowlist，仅写all.blocklist；其他当前账号全局状态保持，模型专属规则不变，之后新增账号默认开启",
+			trace, sourceMode, len(accountNames), global.Allowlist, global.Blocklist, name, enabled, finalBlocks)
+		accountRules["all"], err = json.Marshal(map[string][]string{"blocklist": finalBlocks})
+		if err == nil {
+			models["accounts"], err = json.Marshal(accountRules)
+		}
+	case "model":
+		target = normalizeModelName(target)
+		ids := managementModelIDs(c)
+		if target == "" || !ids[target] {
+			return gatewayValidationError("模型不在当前模型列表或已配置名单中")
+		}
+		blocks, allows := map[string]bool{}, map[string]bool{}
+		for _, id := range c.Models.Blocklist {
+			blocks[normalizeModelName(id)] = true
+		}
+		for _, id := range c.Models.Allowlist {
+			allows[normalizeModelName(id)] = true
+		}
+		delete(blocks, "")
+		delete(allows, "")
+		if len(allows) > 0 {
+			for id := range ids {
+				if !allows[id] {
+					blocks[id] = true
+				}
+			}
+		}
+		if enabled {
+			delete(blocks, target)
+		} else {
+			blocks[target] = true
+		}
+		delete(models, "allowlist")
+		models["blocklist"], err = json.Marshal(sortedNames(blocks))
+	default:
+		return errors.New("未定义的开关类型")
+	}
+	if err != nil {
+		return err
+	}
+	doc["models"], err = json.Marshal(models)
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	c, err = parseRuntimeConfig(data)
+	if err != nil {
+		return err
+	}
+	log.Printf("[管理开关] traceId=%s 阶段=配置落盘 类型=%s 目标=%q 目标启用=%t 说明=只修改目标规则，其他配置保留，凭据和统计不会删除", trace, kind, target, enabled)
+	if err := writeConfigPreservingFile(append(data, '\n'), old); err != nil {
+		return err
+	}
+	if err := applyRuntimeConfig(c, true, trace); err != nil {
+		if restoreErr := writeConfigPreservingFile(old, data); restoreErr != nil {
+			return fmt.Errorf("生效失败: %v；恢复配置失败: %w", err, restoreErr)
+		}
+		return err
+	}
+	runtimeAppliedHash, runtimeHasAppliedHash = sha256.Sum256(append(data, '\n')), true
+	log.Printf("[管理开关] traceId=%s 结果=成功 类型=%s 目标=%q 启用=%t 说明=配置已保存且立即生效，已有上游请求不被强行中断", trace, kind, target, enabled)
+	return nil
+}
+
+func managementModelIDs(c runtimeFileConfig) map[string]bool {
+	ids := map[string]bool{}
+	add := func(id string) {
+		if id = normalizeModelName(id); id != "" {
+			ids[id] = true
+		}
+	}
+	catalog, _ := collectModelIDs(true)
+	for _, id := range catalog {
+		add(id)
+	}
+	for _, id := range c.Models.Allowlist {
+		add(id)
+	}
+	for _, id := range c.Models.Blocklist {
+		add(id)
+	}
+	for id := range c.Models.Accounts {
+		if normalizeModelName(id) != "all" {
+			add(id)
+		}
+	}
+	modelStatsMu.Lock()
+	for id := range modelStats {
+		add(id)
+	}
+	modelStatsMu.Unlock()
+	if snap, err := readStatusSnapshot(); err == nil {
+		for _, row := range snap.Models {
+			add(row.ID)
+		}
+		for _, row := range snap.ModelCatalog {
+			add(row.ID)
+		}
+	}
+	return ids
+}
+
+func handleWebUIAccountToggle(w http.ResponseWriter, r *http.Request) {
+	handleWebUIPolicyToggle(w, r, "account")
+}
+
+func handleWebUIModelToggle(w http.ResponseWriter, r *http.Request) {
+	handleWebUIPolicyToggle(w, r, "model")
+}
+
+func handleWebUIPolicyToggle(w http.ResponseWriter, r *http.Request, kind string) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "仅支持 POST")
+		return
+	}
+	var input struct {
+		Target  string `json:"target"`
+		Enabled *bool  `json:"enabled"`
+	}
+	if err := decodeAdminJSON(w, r, &input); err != nil || input.Enabled == nil || strings.TrimSpace(input.Target) == "" {
+		log.Printf("[管理开关] traceId=%s 阶段=参数校验 结果=拒绝 类型=%s 状态码=400 说明=必须提供目标与布尔开关，未修改配置", debugTraceID(r), kind)
+		writeJSONError(w, http.StatusBadRequest, "必须提供 target 字符串和 enabled 布尔值")
+		return
+	}
+	log.Printf("[管理开关] traceId=%s 阶段=参数校验 类型=%s 目标=%q 启用=%t 结果=通过", debugTraceID(r), kind, input.Target, *input.Enabled)
+	if err := savePolicyToggle(kind, input.Target, *input.Enabled, debugTraceID(r)); err != nil {
+		status := http.StatusInternalServerError
+		var validation gatewayValidationError
+		if errors.As(err, &validation) {
+			status = http.StatusBadRequest
+		}
+		if errors.Is(err, errConfigChange) {
+			status = http.StatusConflict
+		}
+		log.Printf("[管理开关] traceId=%s 结果=失败 类型=%s 状态码=%d 原因=%s 说明=未成功修改，页面须保留原开关", debugTraceID(r), kind, status, safeDebugError(err))
+		writeJSONError(w, status, safeDebugError(err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"target": input.Target, "enabled": *input.Enabled, "saved": true})
 }

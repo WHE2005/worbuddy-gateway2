@@ -1,9 +1,10 @@
 $ErrorActionPreference = 'Stop'
 $base = 'http://127.0.0.1:8327/v1'
-$outCsv = '.\tools\model-probe.csv'
-$outJson = '.\tools\model-probe.json'
+$outCsv = (Join-Path $PSScriptRoot 'model-probe.csv')
+$outJson = (Join-Path $PSScriptRoot 'model-probe.json')
 
-$apiKey = 'REDACTED'
+$apiKey = $env:WB_API_KEY
+if (-not $apiKey) { throw '请先设置环境变量 WB_API_KEY（与 config.json 中的模型 API Key 一致）' }
 $headers = @{ Authorization = "Bearer $apiKey" }
 
 $modelsResp = Invoke-RestMethod -Uri "$base/models" -Headers $headers -TimeoutSec 30

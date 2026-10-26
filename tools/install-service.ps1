@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$root  = '.'
+$root  = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $nssm  = Join-Path $root 'tools\nssm.exe'
 $exe   = Join-Path $root 'workbuddy-gateway.exe'
 $logs  = Join-Path $root 'logs'

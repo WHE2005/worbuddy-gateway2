@@ -29,6 +29,13 @@ workbuddy-gateway
 workbuddy-gateway.exe
 dist/
 
+# 运行状态与运行时产物（服务自动生成，不入库）
+workbuddy-status.json
+workbuddy-checkin-state.json
+stats.json
+tools/switch-result.txt
+tools/install-result.txt
+
 # 日志与临时文件
 *.log
 logs/

@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$root = '.'
+$root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $log = "$root\tools\switch-result.txt"
 Set-Content -Path $log -Value "[$stamp] switch start"

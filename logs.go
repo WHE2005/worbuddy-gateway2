@@ -1,17 +1,24 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 var logRetentionDays atomic.Int64
@@ -310,4 +317,317 @@ func handleWebUILogCleanup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// -----------------------------------------------------------------------------
+// 以下内容原位于 logredact.go（合并整理，逻辑未改动）
+// -----------------------------------------------------------------------------
+
+// 脱敏仅用于日志/调试展示。不得把脱敏后的错误送回业务分类或上游响应解析。
+var sensitiveSecrets sync.Map
+
+var (
+	namedSecretPattern  = regexp.MustCompile(`(?i)(\b(?:access[_-]?token|refresh[_-]?token|admin[_-]?key|api[_-]?key|x-api-key|x-refresh-token|authorization)\b["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'[^']*'|(?:Bearer[ \t]+)?[^\s,;}\[\]]+)`)
+	bearerSecretPattern = regexp.MustCompile(`(?i)(\bBearer[ \t]+)[A-Za-z0-9._~+/=-]+`)
+	// Cookie 头与 URL 查询参数里的会话凭据：未经 registerSecrets 注册的不透明
+	// token（如上游下发的 Set-Cookie、OAuth code）走结构化规则兜底。
+	cookieHeaderPattern = regexp.MustCompile(`(?i)\b(set-cookie|cookie)\s*:\s*[^\r\n]+`)
+	queryTokenPattern   = regexp.MustCompile(`(?i)([?&#](?:signature|sessionid|session|access_token|refresh_token|api_?key|token|ticket|code|sign|auth)=)[^&\s"']+`)
+)
+
+func registerSecrets(values ...string) {
+	for _, value := range values {
+		if value != "" {
+			sensitiveSecrets.Store(value, struct{}{})
+		}
+	}
+}
+
+func registerCredentialSecrets(auth *StoredAuth) {
+	if auth != nil {
+		registerSecrets(auth.Auth.AccessToken, auth.Auth.RefreshToken)
+	}
+}
+
+func redactSensitiveText(text string) string {
+	var secrets []string
+	sensitiveSecrets.Range(func(key, _ any) bool {
+		value := key.(string)
+		secrets = append(secrets, value)
+		// 错误正文可能是 JSON 字符串；同时隐藏其转义后的表示。
+		escaped := strconv.Quote(value)
+		escaped = escaped[1 : len(escaped)-1]
+		if escaped != value {
+			secrets = append(secrets, escaped)
+		}
+		return true
+	})
+	// 长值优先、一次替换，避免重叠秘密值导致部分泄漏或改写替换标记。
+	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
+	var pairs []string
+	for _, secret := range secrets {
+		if len(secret) >= 8 {
+			pairs = append(pairs, secret, "[REDACTED]")
+		}
+	}
+	if len(pairs) > 0 {
+		text = strings.NewReplacer(pairs...).Replace(text)
+	}
+	for _, secret := range secrets {
+		if len(secret) < 8 {
+			text = redactShortSecret(text, secret)
+		}
+	}
+	text = namedSecretPattern.ReplaceAllStringFunc(text, func(match string) string {
+		parts := namedSecretPattern.FindStringSubmatch(match)
+		value := "[REDACTED]"
+		if parts[2][0] == '"' {
+			value = `"[REDACTED]"`
+		} else if parts[2][0] == '\'' {
+			value = "'[REDACTED]'"
+		}
+		return parts[1] + value
+	})
+	text = bearerSecretPattern.ReplaceAllString(text, "${1}[REDACTED]")
+	text = cookieHeaderPattern.ReplaceAllString(text, "${1}: [REDACTED]")
+	text = queryTokenPattern.ReplaceAllString(text, "${1}[REDACTED]")
+	return bearerLikeRe.ReplaceAllString(text, "[REDACTED]")
+}
+
+// 短秘密值仅替换完整词，避免短测试密钥吞掉普通错误原因中的单个字母。
+func redactShortSecret(text, secret string) string {
+	word := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' }
+	var out strings.Builder
+	for {
+		index := strings.Index(text, secret)
+		if index < 0 {
+			out.WriteString(text)
+			return out.String()
+		}
+		end := index + len(secret)
+		left, _ := utf8.DecodeLastRuneInString(text[:index])
+		right, _ := utf8.DecodeRuneInString(text[end:])
+		out.WriteString(text[:index])
+		if (index == 0 || !word(left)) && (end == len(text) || !word(right)) {
+			out.WriteString("[REDACTED]")
+		} else {
+			out.WriteString(secret)
+		}
+		text = text[end:]
+	}
+}
+
+type redactingLogWriter struct{ writer io.Writer }
+
+func (w *redactingLogWriter) Write(data []byte) (int, error) {
+	redacted := redactSensitiveText(string(data))
+	n, err := io.WriteString(w.writer, redacted)
+	if err == nil && n != len(redacted) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return 0, err
+	}
+	// io.Writer 返回消耗的原始输入长度，而不是脱敏后的输出长度。
+	return len(data), nil
+}
+
+func redactDebugValue(value any) any {
+	switch v := value.(type) {
+	case string:
+		return redactSensitiveText(v)
+	case error:
+		return safeDebugError(v)
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			if secretLogField(key) {
+				out[key] = "[REDACTED]"
+			} else {
+				out[key] = redactDebugValue(item)
+			}
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]string, len(v))
+		for key, item := range v {
+			if secretLogField(key) {
+				out[key] = "[REDACTED]"
+			} else {
+				out[key] = redactSensitiveText(item)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = redactDebugValue(item)
+		}
+		return out
+	case []string:
+		out := make([]string, len(v))
+		for i, item := range v {
+			out[i] = redactSensitiveText(item)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func secretLogField(key string) bool {
+	key = strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(key))
+	switch key {
+	case "accesstoken", "refreshtoken", "adminkey", "apikey", "xapikey", "xrefreshtoken", "authorization":
+		return true
+	default:
+		return false
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 以下内容原位于 logtail.go（合并整理，逻辑未改动）
+// -----------------------------------------------------------------------------
+
+const webUILogReadBudget int64 = 1 << 20 // 仅管理日志接口，不限制模型请求或上游响应。
+
+// readTailLines 按块倒序定位，再一次性拼接；复杂度与扫描字节数线性相关。
+// 预算截断时丢弃首个不完整行，避免显示无法可靠脱敏的秘密值片段。
+func readTailLines(f *os.File, n int, budget int64) ([]string, bool, error) {
+	if n <= 0 {
+		return []string{}, false, nil
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, false, fmt.Errorf("只允许读取普通日志文件")
+	}
+	const chunkSize int64 = 16 << 10
+	pos, scanned := st.Size(), int64(0)
+	var chunks [][]byte
+	newlines := 0
+	for pos > 0 && newlines <= n && (budget <= 0 || scanned < budget) {
+		size := min(chunkSize, pos)
+		if budget > 0 {
+			size = min(size, budget-scanned)
+		}
+		pos -= size
+		chunk := make([]byte, int(size))
+		count, err := f.ReadAt(chunk, pos)
+		if err != nil && err != io.EOF {
+			return nil, false, err
+		}
+		chunk = chunk[:count]
+		chunks = append(chunks, chunk)
+		scanned += int64(count)
+		newlines += bytes.Count(chunk, []byte{'\n'})
+		if count != int(size) {
+			return nil, false, fmt.Errorf("日志在读取期间发生截断，请重试")
+		}
+	}
+	truncated := pos > 0 && budget > 0 && scanned >= budget && newlines <= n
+	data := make([]byte, 0, int(scanned))
+	for i := len(chunks) - 1; i >= 0; i-- {
+		data = append(data, chunks[i]...)
+	}
+	if pos > 0 {
+		if end := bytes.IndexByte(data, '\n'); end >= 0 {
+			data = data[end+1:]
+		} else {
+			data = nil
+		}
+	}
+	lines := make([]string, 0, n)
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		if len(line) != 0 {
+			lines = append(lines, string(line))
+		}
+	}
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return lines, truncated, nil
+}
+
+// -----------------------------------------------------------------------------
+// 以下内容原位于 weblogfocus.go（合并整理，逻辑未改动）
+// -----------------------------------------------------------------------------
+
+// parseLogOffset 解析告警带来的日志定位偏移；缺省或非法时返回 -1 表示按尾部读取。
+func parseLogOffset(raw string) int64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return -1
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || v < 0 {
+		return -1
+	}
+	return v
+}
+
+// readWebLogAround 读取覆盖指定字节偏移的日志窗口，供「告警 → 跳到那一行」使用。
+// 返回窗口内的行、目标行下标、以及是否真的定位到了（文件被轮转或清理时为 false）。
+func readWebLogAround(name string, offset int64, span int64) ([]string, int, bool, error) {
+	root, err := os.OpenRoot(logDir)
+	if err != nil {
+		return nil, -1, false, err
+	}
+	defer root.Close()
+	f, err := root.Open(name)
+	if err != nil {
+		return nil, -1, false, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, -1, false, err
+	}
+	size := info.Size()
+	resolved := offset <= size
+	start, end := offset-span, offset+span
+	if start < 0 {
+		start = 0
+	}
+	if end > size {
+		end = size
+	}
+	if end-start > webUILogReadBudget {
+		end = start + webUILogReadBudget
+	}
+	if end <= start {
+		return nil, -1, resolved, nil
+	}
+	buf := make([]byte, end-start)
+	n, readErr := f.ReadAt(buf, start)
+	if readErr != nil && readErr != io.EOF {
+		return nil, -1, false, readErr
+	}
+	buf = buf[:n]
+	// 记录窗口首行在文件中的真实起点，便于把偏移换算成行下标。
+	cursor := start
+	if start > 0 {
+		if cut := strings.IndexByte(string(buf), '\n'); cut >= 0 {
+			cursor += int64(cut) + 1
+			buf = buf[cut+1:]
+		} else {
+			buf = nil
+		}
+	}
+	lines := strings.Split(string(buf), "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	focus := -1
+	for i, line := range lines {
+		next := cursor + int64(len(line)) + 1
+		if offset >= cursor && offset < next {
+			focus = i
+			break
+		}
+		cursor = next
+	}
+	return lines, focus, resolved && focus >= 0, nil
 }
